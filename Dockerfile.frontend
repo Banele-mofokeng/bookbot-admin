@@ -4,7 +4,9 @@ COPY package*.json ./
 RUN npm ci
 COPY . .
 RUN chmod +x ./node_modules/.bin/vite
-ARG VITE_API_URL
+
+# Hardcode your bot URL here as a fallback
+ARG VITE_API_URL=https://whatsapp-bot-whatsapp-bot.a8x5ve.easypanel.host
 ENV VITE_API_URL=$VITE_API_URL
 RUN npx --no-install vite build
 
