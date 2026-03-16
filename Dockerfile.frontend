@@ -1,11 +1,12 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci --legacy-peer-deps
+RUN npm ci
 COPY . .
+RUN chmod +x ./node_modules/.bin/vite
 ARG VITE_API_URL
 ENV VITE_API_URL=$VITE_API_URL
-RUN ./node_modules/.bin/vite build
+RUN npx --no-install vite build
 
 FROM nginx:alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
