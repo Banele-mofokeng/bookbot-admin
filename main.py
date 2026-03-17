@@ -381,6 +381,16 @@ def cancel_appointment(appointment_id: int):
         session.commit()
     return {"status": "cancelled", "id": appointment_id}
 
+@app.post("/admin/migrate-reset")
+def migrate_reset():
+    """
+    Drops and recreates all tables. 
+    WARNING: deletes all data. Only use before you have real bookings.
+    """
+    SQLModel.metadata.drop_all(engine)
+    SQLModel.metadata.create_all(engine)
+    return {"status": "done"}
+
 
 # =============================================================================
 # 10. SEED ENDPOINT  — inserts your first tenant for testing
