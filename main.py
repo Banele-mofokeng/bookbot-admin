@@ -550,16 +550,16 @@ async def handle_webhook(request: Request):
                 send_date_menu(tenant, customer_num)
 
         elif text == "2":
-            # Check queue status
+            # Check queue status — search upcoming dates not just today
             today = datetime.now().date().isoformat()
             with Session(engine) as s:
                 entry = s.exec(
                     select(QueueEntry).where(
                         QueueEntry.tenant_id      == tenant.id,
                         QueueEntry.customer_number == customer_num,
-                        QueueEntry.queue_date      == today,
-                        QueueEntry.status          == "Waiting"
-                    )
+                        QueueEntry.queue_date      >= today,
+                        QueueEntry.status.in_(["Waiting", "InService"])
+                    ).order_by(QueueEntry.queue_date, QueueEntry.joined_at)
                 ).first()
 
                 if not entry:
@@ -592,16 +592,16 @@ async def handle_webhook(request: Request):
             clear_session(tenant.id, customer_num)
 
         elif text == "3":
-            # Leave the queue
+            # Leave the queue — search upcoming dates
             today = datetime.now().date().isoformat()
             with Session(engine) as s:
                 entry = s.exec(
                     select(QueueEntry).where(
                         QueueEntry.tenant_id      == tenant.id,
                         QueueEntry.customer_number == customer_num,
-                        QueueEntry.queue_date      == today,
+                        QueueEntry.queue_date      >= today,
                         QueueEntry.status          == "Waiting"
-                    )
+                    ).order_by(QueueEntry.queue_date, QueueEntry.joined_at)
                 ).first()
 
                 if not entry:
