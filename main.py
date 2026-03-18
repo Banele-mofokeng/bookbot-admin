@@ -979,8 +979,16 @@ def list_services(tenant_id: int):
         ).all()
 
 
+class ServiceCreate(SQLModel):
+    tenant_id:         int
+    name:              str
+    duration_minutes:  int  = 60
+    is_active:         bool = True
+
+
 @app.post("/admin/services")
-def create_service(service: Service):
+def create_service(data: ServiceCreate):
+    service = Service(**data.dict())
     with Session(engine) as s:
         s.add(service)
         s.commit()
@@ -1028,8 +1036,9 @@ def list_agents(tenant_id: int):
 def create_agent(body: Dict[str, Any]):
     """Create an agent and assign their services in one call."""
     service_ids = body.pop("service_ids", [])
+    body.pop("id", None)  # never accept id from client
     with Session(engine) as s:
-        agent = Agent(**{k: v for k, v in body.items() if hasattr(Agent, k)})
+        agent = Agent(**{k: v for k, v in body.items() if hasattr(Agent, k) and k != "id"})
         s.add(agent)
         s.commit()
         s.refresh(agent)
