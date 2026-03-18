@@ -1069,8 +1069,13 @@ def health():
 
 @app.post("/admin/migrate-reset")
 def migrate_reset():
-    """Drop and recreate all tables. WARNING: deletes all data."""
-    SQLModel.metadata.drop_all(engine)
+    """Drop and recreate all tables using CASCADE to handle FK dependencies."""
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        conn.execute(text(
+            "DROP TABLE IF EXISTS agentservice, queueentry, agent, service, tenant CASCADE"
+        ))
+        conn.commit()
     SQLModel.metadata.create_all(engine)
     return {"status": "done"}
 
