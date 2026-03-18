@@ -925,8 +925,26 @@ def list_tenants():
         return s.exec(select(Tenant)).all()
 
 
+class TenantCreate(SQLModel):
+    """Separate create schema so id is never accepted from the client."""
+    business_name:      str
+    business_type:      str  = "General"
+    whatsapp_number:    str
+    owner_number:       str  = ""
+    evolution_instance: str
+    evolution_api_key:  str
+    evolution_api_url:  str
+    agent_label:        str  = "Agent"
+    service_label:      str  = "Service"
+    queue_opens:        int  = 8
+    queue_closes:       int  = 17
+    advance_days:       int  = 1
+    is_active:          bool = True
+
+
 @app.post("/admin/tenants")
-def create_tenant(tenant: Tenant):
+def create_tenant(data: TenantCreate):
+    tenant = Tenant(**data.dict())
     with Session(engine) as s:
         s.add(tenant)
         s.commit()

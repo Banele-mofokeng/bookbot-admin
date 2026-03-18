@@ -30,7 +30,7 @@ export default function Tenants({ tenants, reload }) {
             {tenants.length} registered {tenants.length === 1 ? 'business' : 'businesses'}
           </p>
         </div>
-        <Button onClick={() => navigate('/tenants/new')}>+ Add Business</Button>
+        <Button onClick={() => navigate('/businesses/new')}>+ Add Business</Button>
       </div>
 
       {tenants.length === 0 ? (
@@ -67,7 +67,7 @@ export default function Tenants({ tenants, reload }) {
                 <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
                   <Button
                     variant="ghost" size="sm"
-                    onClick={() => navigate(`/tenants/${t.id}/edit`)}
+                    onClick={() => navigate(`/businesses/${t.id}/edit`)}
                   >
                     Edit
                   </Button>
