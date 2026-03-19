@@ -22,7 +22,19 @@ def today_str() -> str:
     return now().date().isoformat()
 
 def yesterday_str() -> str:
-    return yesterday_str()
+    return (now().date() - timedelta(days=1)).isoformat()
+
+def normalize_number(number: str) -> str:
+    """
+    Ensures a SA number has the correct country code.
+    0812345678   → 27812345678
+    27812345678  → 27812345678
+    +27812345678 → 27812345678
+    """
+    n = number.strip().replace("+", "").replace(" ", "")
+    if n.startswith("0"):
+        n = "27" + n[1:]
+    return n
 
 # =============================================================================
 # 1. CONFIGURATION
@@ -146,7 +158,7 @@ async def on_shutdown():
 # =============================================================================
 
 def get_tenant_by_number(raw: str) -> Optional[Tenant]:
-    clean = raw.replace("@s.whatsapp.net", "").replace("@lid", "")
+    clean = normalize_number(raw.replace("@s.whatsapp.net", "").replace("@lid", ""))
     with Session(engine) as s:
         return s.exec(
             select(Tenant).where(Tenant.whatsapp_number == clean, Tenant.is_active == True)
@@ -211,30 +223,42 @@ def calculate_estimated_start(tenant: Tenant, agent_id: int,
 
 def assign_agent(tenant: Tenant, service_id: int,
                  preferred_agent_id: Optional[int], queue_date: str) -> Optional[int]:
-    """
-    Pick the best agent for a service:
-    - If customer has a preference and that agent can do the service → use them
-    - Otherwise → assign the agent with the shortest backlog who can do the service
-    """
     with Session(engine) as s:
-        # All agents who can do this service for this tenant
-        capable_agent_ids = [
-            row.agent_id for row in s.exec(
-                select(AgentService).where(AgentService.service_id == service_id)
+        # Get tenant agents first, then find which can do this service
+        tenant_agent_ids = [
+            a.id for a in s.exec(
+                select(Agent).where(Agent.tenant_id == tenant.id, Agent.is_active == True)
             ).all()
         ]
+        print(f"🔍 assign_agent | tenant={tenant.id} service={service_id} tenant_agents={tenant_agent_ids}")
+
+        if not tenant_agent_ids:
+            print(f"⚠️  No active agents for tenant {tenant.id}")
+            return None
+
+        capable_agent_ids = [
+            row.agent_id for row in s.exec(
+                select(AgentService).where(
+                    AgentService.service_id == service_id,
+                    AgentService.agent_id.in_(tenant_agent_ids)
+                )
+            ).all()
+        ]
+        print(f"🔍 assign_agent | capable_agents={capable_agent_ids}")
+
         if not capable_agent_ids:
+            print(f"⚠️  No agents can do service {service_id} for tenant {tenant.id}")
             return None
 
         active_agents = s.exec(
             select(Agent).where(
                 Agent.id.in_(capable_agent_ids),
-                Agent.tenant_id == tenant.id,
                 Agent.is_active == True
             )
         ).all()
 
         if not active_agents:
+            print(f"⚠️  No active agents in capable list {capable_agent_ids}")
             return None
 
         # Honor preference if that agent is capable
@@ -632,6 +656,16 @@ async def handle_webhook(request: Request):
                         f"✅ You've been removed from the queue at *{tenant.business_name}*.\n\n"
                         f"Reply *menu* anytime to rejoin."
                     )
+                    if tenant.owner_number:
+                        agent   = s.get(Agent, entry.agent_id)
+                        service = s.get(Service, entry.service_id)
+                        date_display = datetime.strptime(entry.queue_date, "%Y-%m-%d").strftime("%a %d %b")
+                        send_text(tenant, normalize_number(tenant.owner_number),
+                            f"\u274c *Queue Cancellation*\n\n"
+                            f"\U0001f464 {entry.customer_name}\n"
+                            f"\U0001f4bc {service.name if service else ''}\n"
+                            f"\U0001f4c5 {date_display}"
+                        )
             clear_session(tenant.id, customer_num)
 
         else:
@@ -741,6 +775,7 @@ async def handle_webhook(request: Request):
             eta     = calculate_estimated_start(tenant, assigned_agent_id, queue_date, backlog)
 
             # Count total waiting across whole tenant queue for display position
+            print(f"💾 Saving queue entry | tenant={tenant.id} service={service_id} agent={assigned_agent_id} date={queue_date} customer={customer_num}")
             with Session(engine) as s:
                 total_waiting = len(s.exec(
                     select(QueueEntry).where(
@@ -788,7 +823,7 @@ async def handle_webhook(request: Request):
 
             # Notify owner
             if tenant.owner_number:
-                send_text(tenant, tenant.owner_number,
+                send_text(tenant, normalize_number(tenant.owner_number),
                     f"🔔 *New Queue Entry*\n\n"
                     f"👤 {customer_name}\n"
                     f"💼 {service.name if service else ''}\n"
