@@ -386,13 +386,14 @@ def send_service_menu(tenant: Tenant, number: str, services: list):
 def send_agent_menu(tenant: Tenant, number: str,
                     agents: list, queue_date: str, service_id: int):
     lines = []
-    with Session(engine) as s:
-        for i, agent in enumerate(agents):
-            backlog = get_agent_backlog_minutes(agent.id, tenant.id, queue_date)
-            eta     = calculate_estimated_start(tenant, agent.id, queue_date, backlog)
-            lines.append(
-                f"{i+1}️⃣ {agent.name}  _(next free around {format_eta(eta)})_"
-            )
+    for i, agent in enumerate(agents):
+        agent_id = agent["id"] if isinstance(agent, dict) else agent.id
+        name     = agent["name"] if isinstance(agent, dict) else agent.name
+        backlog  = get_agent_backlog_minutes(agent_id, tenant.id, queue_date)
+        eta      = calculate_estimated_start(tenant, agent_id, queue_date, backlog)
+        lines.append(
+            f"{i+1}️⃣ {name}  _(next free around {format_eta(eta)})_"
+        )
     lines.append(f"{len(agents)+1}️⃣ No preference _(assign me to earliest)_")
 
     send_text(tenant, number,
@@ -709,22 +710,36 @@ async def handle_webhook(request: Request):
         if text.isdigit() and 1 <= int(text) <= len(service_ids):
             chosen_service_id = service_ids[int(text) - 1]
 
-            # Find capable agents
+            # Find capable agents — scope everything to this tenant
             with Session(engine) as s:
-                capable_ids = [
-                    row.agent_id for row in s.exec(
-                        select(AgentService).where(
-                            AgentService.service_id == chosen_service_id
+                # Get all active agent IDs for this tenant
+                tenant_agent_ids = [
+                    a.id for a in s.exec(
+                        select(Agent).where(
+                            Agent.tenant_id == tenant.id,
+                            Agent.is_active == True
                         )
                     ).all()
                 ]
-                agents = s.exec(
+                # Filter to those who can do the chosen service
+                capable_ids = [
+                    row.agent_id for row in s.exec(
+                        select(AgentService).where(
+                            AgentService.service_id == chosen_service_id,
+                            AgentService.agent_id.in_(tenant_agent_ids)
+                        )
+                    ).all()
+                ]
+                print(f"🔍 awaiting_service | service={chosen_service_id} tenant_agents={tenant_agent_ids} capable={capable_ids}")
+
+                # Load as plain dicts so they survive session close
+                agent_rows = s.exec(
                     select(Agent).where(
                         Agent.id.in_(capable_ids),
-                        Agent.tenant_id == tenant.id,
                         Agent.is_active == True
                     )
                 ).all()
+                agents = [{"id": a.id, "name": a.name} for a in agent_rows]
 
             if not agents:
                 send_text(tenant, customer_num,
@@ -735,7 +750,7 @@ async def handle_webhook(request: Request):
                     "state": "awaiting_agent",
                     "queue_date": queue_date,
                     "service_id": chosen_service_id,
-                    "agent_ids": [a.id for a in agents]
+                    "agent_ids": [a["id"] for a in agents]
                 })
                 send_agent_menu(tenant, customer_num, agents, queue_date, chosen_service_id)
         else:
