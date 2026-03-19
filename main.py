@@ -403,14 +403,32 @@ def send_agent_menu(tenant: Tenant, number: str,
     )
 
 
+def queue_is_open_today(tenant: Tenant) -> bool:
+    """Returns True if the queue is still accepting entries right now."""
+    current_hour = now().hour
+    return tenant.queue_opens <= current_hour < tenant.queue_closes
+
+
 def send_date_menu(tenant: Tenant, number: str):
-    today   = now().date()
-    options = []
+    today      = now().date()
+    today_open = queue_is_open_today(tenant)
+    options    = []
+
     for delta in range(14):
         d = today + timedelta(days=delta)
+        # Skip today if the queue has already closed
+        if delta == 0 and not today_open:
+            continue
+        options.append(d)
         if len(options) == tenant.advance_days + 1:
             break
-        options.append(d)
+
+    if not options:
+        send_text(tenant, number,
+            f"Sorry, the queue at *{tenant.business_name}* is currently closed.\n\n"
+            f"We open at {tenant.queue_opens:02d}:00. Please try again tomorrow! 🙏"
+        )
+        return
 
     lines = []
     for i, d in enumerate(options):
@@ -419,7 +437,7 @@ def send_date_menu(tenant: Tenant, number: str):
             label += " _(today)_"
         elif d == today + timedelta(days=1):
             label += " _(tomorrow)_"
-        lines.append(f"{i+1}️⃣ {label}")
+        lines.append(f"{i+1}\u0031\ufe0f\u20e3 {label}")
 
     set_session(tenant.id, number, {
         "state": "awaiting_date",
@@ -427,11 +445,10 @@ def send_date_menu(tenant: Tenant, number: str):
     })
 
     send_text(tenant, number,
-        f"*Which day would you like to queue for?* 📅\n\n"
+        f"*Which day would you like to queue for?* \U0001f4c5\n\n"
         + "\n".join(lines)
         + "\n\nReply with the *number* of the day."
     )
-
 
 # =============================================================================
 # 8. BACKGROUND JOBS
@@ -560,6 +577,15 @@ async def handle_webhook(request: Request):
     # ── MAIN MENU ─────────────────────────────────────────────────────────
     if state == "main_menu":
         if text == "1":
+            # Check if queue is closed and no advance booking allowed
+            if tenant.advance_days == 0 and not queue_is_open_today(tenant):
+                send_text(tenant, customer_num,
+                    f"Sorry, the queue at *{tenant.business_name}* is currently closed.\n\n"
+                    f"We open at {tenant.queue_opens:02d}:00. Please try again tomorrow! 🙏"
+                )
+                clear_session(tenant.id, customer_num)
+                return {"status": "success"}
+
             # Start queue flow — pick a date first
             if tenant.advance_days == 0:
                 # Today only — skip date picker
