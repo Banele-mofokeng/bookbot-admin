@@ -50,10 +50,13 @@ export default function Tenants({ tenants, reload }) {
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '6px 24px', marginTop: 10 }}>
                     {[
-                      ['WhatsApp', t.whatsapp_number],
-                      ['Instance', t.evolution_instance],
-                      ['Service', t.service_name],
-                      ['Hours', `${t.working_hours_start}:00 – ${t.working_hours_end}:00`],
+                      ['WhatsApp',      t.whatsapp_number],
+                      ['Instance',      t.evolution_instance],
+                      ['Agent Label',   t.agent_label],
+                      ['Service Label', t.service_label],
+                      ['Type',          t.business_type],
+                      ['Hours',         `${t.queue_opens}:00 – ${t.queue_closes}:00`],
+                      ['Advance Days',  `${t.advance_days} day(s)`],
                     ].map(([label, val]) => (
                       <div key={label}>
                         <span style={{ fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--muted)' }}>{label}</span>

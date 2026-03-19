@@ -3,11 +3,26 @@ import json
 import requests
 import redis
 from datetime import datetime, timedelta, time, date
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import SQLModel, Field, create_engine, Session, select, Relationship
 from typing import Optional, Dict, Any, List
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# Timezone — set TZ env var to your local timezone e.g. "Africa/Johannesburg"
+TZ = ZoneInfo(os.getenv("TZ", "Africa/Johannesburg"))
+
+def now() -> datetime:
+    """Current local time aware of the configured timezone."""
+    return datetime.now(TZ).replace(tzinfo=None)
+
+def today_str() -> str:
+    """Today's date as ISO string in local timezone."""
+    return now().date().isoformat()
+
+def yesterday_str() -> str:
+    return yesterday_str()
 
 # =============================================================================
 # 1. CONFIGURATION
@@ -89,7 +104,7 @@ class QueueEntry(SQLModel, table=True):
     position: int              = 0                   # display position in full queue
     notified_two_away: bool    = False
     notified_next: bool        = False
-    joined_at: datetime        = Field(default_factory=datetime.now)
+    joined_at: datetime        = Field(default_factory=now)
 
 
 def create_db_and_tables():
@@ -364,7 +379,7 @@ def send_agent_menu(tenant: Tenant, number: str,
 
 
 def send_date_menu(tenant: Tenant, number: str):
-    today   = datetime.now().date()
+    today   = now().date()
     options = []
     for delta in range(14):
         d = today + timedelta(days=delta)
@@ -400,7 +415,7 @@ def send_date_menu(tenant: Tenant, number: str):
 async def notification_job():
     """Runs every 2 minutes. Checks queue positions and sends 'you're 2 away' and 'you're next'."""
     print("🔔 Running notification check...")
-    today = datetime.now().date().isoformat()
+    today = today_str()
 
     with Session(engine) as s:
         waiting = s.exec(
@@ -458,7 +473,7 @@ async def notification_job():
 async def midnight_reset_job():
     """Runs at 00:01 every night. Closes out yesterday's queue."""
     print("🌙 Running midnight reset...")
-    yesterday = (datetime.now().date() - timedelta(days=1)).isoformat()
+    yesterday = yesterday_str()
 
     with Session(engine) as s:
         leftover = s.exec(
@@ -525,7 +540,7 @@ async def handle_webhook(request: Request):
                 # Today only — skip date picker
                 set_session(tenant.id, customer_num, {
                     "state": "awaiting_service",
-                    "queue_date": datetime.now().date().isoformat()
+                    "queue_date": today_str()
                 })
                 with Session(engine) as s:
                     services = s.exec(
@@ -541,7 +556,7 @@ async def handle_webhook(request: Request):
                 else:
                     set_session(tenant.id, customer_num, {
                         "state": "awaiting_service",
-                        "queue_date": datetime.now().date().isoformat(),
+                        "queue_date": today_str(),
                         "service_ids": [svc.id for svc in services]
                     })
                     send_service_menu(tenant, customer_num, services)
@@ -551,7 +566,7 @@ async def handle_webhook(request: Request):
 
         elif text == "2":
             # Check queue status — search upcoming dates not just today
-            today = datetime.now().date().isoformat()
+            today = today_str()
             with Session(engine) as s:
                 entry = s.exec(
                     select(QueueEntry).where(
@@ -593,7 +608,7 @@ async def handle_webhook(request: Request):
 
         elif text == "3":
             # Leave the queue — search upcoming dates
-            today = datetime.now().date().isoformat()
+            today = today_str()
             with Session(engine) as s:
                 entry = s.exec(
                     select(QueueEntry).where(
@@ -655,7 +670,7 @@ async def handle_webhook(request: Request):
     # ── SERVICE SELECTION ─────────────────────────────────────────────────
     if state == "awaiting_service":
         service_ids = sess.get("service_ids", [])
-        queue_date  = sess.get("queue_date", datetime.now().date().isoformat())
+        queue_date  = sess.get("queue_date", today_str())
 
         if text.isdigit() and 1 <= int(text) <= len(service_ids):
             chosen_service_id = service_ids[int(text) - 1]
@@ -698,7 +713,7 @@ async def handle_webhook(request: Request):
     if state == "awaiting_agent":
         agent_ids   = sess.get("agent_ids", [])
         service_id  = sess.get("service_id")
-        queue_date  = sess.get("queue_date", datetime.now().date().isoformat())
+        queue_date  = sess.get("queue_date", today_str())
         no_pref_idx = len(agent_ids) + 1  # last option is "no preference"
 
         if text.isdigit():
@@ -798,7 +813,7 @@ async def handle_webhook(request: Request):
 @app.get("/admin/queue/{tenant_id}")
 def get_queue(tenant_id: int, queue_date: Optional[str] = None):
     """Get full queue for a tenant on a given date (defaults to today)."""
-    target_date = queue_date or datetime.now().date().isoformat()
+    target_date = queue_date or today_str()
     with Session(engine) as s:
         entries = s.exec(
             select(QueueEntry).where(
@@ -865,7 +880,7 @@ def add_walkin(body: Dict[str, Any]):
     service_id  = body.get("service_id")
     agent_id    = body.get("agent_id")        # optional preferred agent
     name        = body.get("customer_name", "Walk-in")
-    queue_date  = body.get("queue_date", datetime.now().date().isoformat())
+    queue_date  = body.get("queue_date", today_str())
 
     with Session(engine) as s:
         tenant = s.get(Tenant, tenant_id)
