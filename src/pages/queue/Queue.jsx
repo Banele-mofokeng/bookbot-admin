@@ -45,22 +45,33 @@ function getNext7Days() {
 }
 
 function WalkinModal({ tenant, services, agents, onClose, onAdd }) {
-  const [name, setName]           = useState('')
-  const [serviceId, setServiceId] = useState('')
-  const [agentId, setAgentId]     = useState('')
-  const [saving, setSaving]       = useState(false)
-  const { toast, show }           = useToast()
+  const [name, setName]                     = useState('')
+  const [phone, setPhone]                   = useState('')
+  const [additionalNames, setAdditionalNames] = useState('')
+  const [serviceId, setServiceId]           = useState('')
+  const [agentId, setAgentId]               = useState('')
+  const [saving, setSaving]                 = useState(false)
+  const { toast, show }                     = useToast()
+
+  const isAfterHours = (() => {
+    if (!tenant) return false
+    const h = new Date().getHours()
+    return h < (tenant.queue_opens || 8) || h >= (tenant.queue_closes || 17)
+  })()
 
   async function submit() {
     if (!name.trim() || !serviceId) { show('Name and service are required.', 'error'); return }
+    if (isAfterHours) { show(`Queue is closed. Opens at ${String(tenant.queue_opens || 8).padStart(2,'0')}:00.`, 'error'); return }
     setSaving(true)
     try {
       await api.addWalkin({
-        tenant_id:     tenant.id,
-        service_id:    parseInt(serviceId),
-        agent_id:      agentId ? parseInt(agentId) : null,
-        customer_name: name.trim(),
-        queue_date:    new Date().toISOString().split('T')[0],
+        tenant_id:        tenant.id,
+        service_id:       parseInt(serviceId),
+        agent_id:         agentId ? parseInt(agentId) : null,
+        customer_name:    name.trim(),
+        customer_phone:   phone.trim(),
+        additional_names: additionalNames.trim(),
+        queue_date:       new Date().toISOString().split('T')[0],
       })
       onAdd()
     } catch (e) {
@@ -72,25 +83,34 @@ function WalkinModal({ tenant, services, agents, onClose, onAdd }) {
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200 }}>
-      <Card style={{ width: 420, padding: 28 }}>
-        <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 20 }}>Add Walk-in</div>
+      <Card style={{ width: 460, padding: 28, maxHeight: '90vh', overflowY: 'auto' }}>
+        <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 4 }}>Add Walk-in</div>
+        <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 20 }}>
+          {isAfterHours
+            ? `⚠️ Queue is closed — opens at ${String(tenant?.queue_opens || 8).padStart(2,'0')}:00`
+            : 'Add a customer who arrived in person'}
+        </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-          <Input label="Customer Name" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Thabo" />
-          <Select label="Service" value={serviceId} onChange={e => setServiceId(e.target.value)}>
+          <Input label="Customer Name *" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Thabo Nkosi" />
+          <Input label="WhatsApp Number (optional)" value={phone} onChange={e => setPhone(e.target.value)}
+            placeholder="27812345678 — for ETA notifications" />
+          <Input label="Additional Names (optional)" value={additionalNames} onChange={e => setAdditionalNames(e.target.value)}
+            placeholder="e.g. Lebo, Siya — for family or group bookings" />
+          <Select label="Service *" value={serviceId} onChange={e => setServiceId(e.target.value)}>
             <option value="">Select service...</option>
             {services.filter(s => s.is_active).map(s => (
               <option key={s.id} value={s.id}>{s.name} ({s.duration_minutes} min)</option>
             ))}
           </Select>
           <Select label={`Preferred ${tenant?.agent_label || 'Agent'} (optional)`} value={agentId} onChange={e => setAgentId(e.target.value)}>
-            <option value="">No preference</option>
+            <option value="">No preference — assign to earliest</option>
             {agents.filter(a => a.is_active).map(a => (
               <option key={a.id} value={a.id}>{a.name}</option>
             ))}
           </Select>
         </div>
         <div style={{ display: 'flex', gap: 10, marginTop: 20 }}>
-          <Button onClick={submit} loading={saving}>Add to Queue</Button>
+          <Button onClick={submit} loading={saving} disabled={isAfterHours}>Add to Queue</Button>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
         </div>
         <Toast toast={toast} />
@@ -231,8 +251,14 @@ export default function Queue({ tenants }) {
                   <td style={{ padding: '14px 16px', fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--muted)' }}>#{entry.position}</td>
                   <td style={{ padding: '14px 16px' }}>
                     <div style={{ fontWeight: 700, fontSize: 13 }}>{entry.customer_name}</div>
+                    {entry.additional_names && (
+                      <div style={{ fontSize: 11, color: 'var(--accent)', marginTop: 2 }}>+{entry.additional_names}</div>
+                    )}
                     {entry.customer_number !== 'walkin' && (
                       <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>{entry.customer_number}</div>
+                    )}
+                    {entry.customer_number === 'walkin' && entry.customer_phone && (
+                      <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--muted2)', marginTop: 2 }}>{entry.customer_phone}</div>
                     )}
                   </td>
                   <td style={{ padding: '14px 16px', fontSize: 13 }}>{entry.service}</td>
