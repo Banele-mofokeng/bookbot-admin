@@ -109,7 +109,8 @@ class QueueEntry(SQLModel, table=True):
     preferred_agent_id: Optional[int] = Field(default=None, foreign_key="agent.id")
     customer_number: str                             # "27764519653@s.whatsapp.net"
     customer_name: str
-    additional_names: str      = ""                  # comma-separated children names e.g. "Lebo,Siya"
+    additional_names: str      = ""                  # kept for legacy walk-in use; children now get own entries
+    parent_entry_id: Optional[int] = Field(default=None)  # set on child entries to link back to parent
     customer_phone: str        = ""                  # walk-in phone for notifications e.g. "27812345678"
     status: str                = "Waiting"           # Waiting|InService|Done|NoShow|Cancelled
     booked_via: str            = "whatsapp"          # whatsapp | walkin
@@ -565,15 +566,22 @@ async def midnight_reset_job():
 
 def _do_assign(tenant, customer_num: str, customer_name: str,
                assigned_agent_id: int, service_id: int,
-               queue_date: str, sess: dict):
+               queue_date: str, sess: dict,
+               include_parent: bool = True,
+               children_names: list = None):
     """
-    Saves the queue entry, sends confirmation, asks about children.
+    Saves queue entries and sends confirmation.
+    include_parent=False means only child entries are created (parent is just escorting).
+    children_names is a list of child name strings; each gets its own QueueEntry.
     Shared by single-agent auto-assign and manual agent pick paths.
     """
+    if children_names is None:
+        children_names = []
+
     backlog  = get_agent_backlog_minutes(assigned_agent_id, tenant.id, queue_date)
     eta      = calculate_estimated_start(tenant, assigned_agent_id, queue_date, backlog)
 
-    print(f"\U0001f4be Saving entry | tenant={tenant.id} service={service_id} agent={assigned_agent_id} date={queue_date}")
+    print(f"\U0001f4be Saving entry | tenant={tenant.id} service={service_id} agent={assigned_agent_id} date={queue_date} parent={include_parent} children={children_names}")
 
     with Session(engine) as s:
         total_waiting = len(s.exec(
@@ -583,22 +591,44 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
                 QueueEntry.status     == "Waiting"
             )
         ).all())
-        position = total_waiting + 1
+        next_position = total_waiting + 1
 
-        entry = QueueEntry(
-            tenant_id          = tenant.id,
-            service_id         = service_id,
-            agent_id           = assigned_agent_id,
-            customer_number    = customer_num,
-            customer_name      = customer_name,
-            queue_date         = queue_date,
-            estimated_start    = eta,
-            position           = position,
-            booked_via         = "whatsapp"
-        )
-        s.add(entry)
+        parent_entry = None
+        if include_parent:
+            parent_entry = QueueEntry(
+                tenant_id          = tenant.id,
+                service_id         = service_id,
+                agent_id           = assigned_agent_id,
+                customer_number    = customer_num,
+                customer_name      = customer_name,
+                queue_date         = queue_date,
+                estimated_start    = eta,
+                position           = next_position,
+                booked_via         = "whatsapp"
+            )
+            s.add(parent_entry)
+            s.commit()
+            s.refresh(parent_entry)
+            next_position += 1
+
+        child_entries = []
+        for child_name in children_names:
+            child_entry = QueueEntry(
+                tenant_id          = tenant.id,
+                service_id         = service_id,
+                agent_id           = assigned_agent_id,
+                customer_number    = customer_num,
+                customer_name      = child_name,
+                queue_date         = queue_date,
+                estimated_start    = eta,
+                position           = next_position,
+                booked_via         = "whatsapp",
+                parent_entry_id    = parent_entry.id if parent_entry else None,
+            )
+            s.add(child_entry)
+            child_entries.append((child_name, next_position))
+            next_position += 1
         s.commit()
-        s.refresh(entry)
 
         agent   = s.get(Agent, assigned_agent_id)
         service = s.get(Service, service_id)
@@ -606,46 +636,44 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
     clear_session(tenant.id, customer_num)
 
     date_display = datetime.strptime(queue_date, "%Y-%m-%d").strftime("%a %d %b")
-    ahead_count  = position - 1
 
-    # Position-aware notification promise
-    if position == 1:
+    # Build position summary lines
+    position_lines = ""
+    if include_parent:
+        position_lines += f"\U0001f4cd *Your position:* #{parent_entry.position}\n"
+    for child_name, child_pos in child_entries:
+        position_lines += f"\U0001f476 *{child_name}:* #{child_pos}\n"
+
+    # Notification promise is based on the first queued position
+    first_position = parent_entry.position if include_parent else (child_entries[0][1] if child_entries else 1)
+    if first_position == 1:
         notify_line = "You\'re first in line \U0001f3c6 — head over when you\'re ready."
-    elif position == 2:
+    elif first_position == 2:
         notify_line = "We\'ll notify you when you\'re up next."
     else:
         notify_line = f"We\'ll notify you when you\'re 2 away and when you\'re next."
 
     send_text(tenant, customer_num,
         f"\u2705 *You\'re in the queue!*\n\n"
-        f"\U0001f4cd Position: #{position}\n"
+        f"{position_lines}"
         f"\U0001f464 {tenant.agent_label}: {agent.name if agent else 'TBD'}\n"
         f"\U0001f4bc {tenant.service_label}: {service.name if service else 'TBD'}\n"
         f"\U0001f4c5 Date: {date_display}\n"
         f"\u23f0 Estimated time: {format_eta(eta)}\n\n"
         f"{notify_line}\n"
-        f"Reply *status* anytime to check your position.\n\n"
-        f"Are you booking for any children too?\n"
-        f"1\ufe0f\u20e3 1 child\n"
-        f"2\ufe0f\u20e3 2 children\n"
-        f"0\ufe0f\u20e3 No, just me\n\n"
-        f"Reply *0*, *1*, or *2*"
+        f"Reply *status* anytime to check your position."
     )
 
-    # Store entry_id in session for children flow
-    set_session(tenant.id, customer_num, {
-        "state": "awaiting_children",
-        "entry_id": entry.id,
-    })
-
-    # Notify owner
+    # Notify owner (report the first booked person)
+    report_name = customer_name if include_parent else (children_names[0] if children_names else customer_name)
+    report_position = parent_entry.position if include_parent else (child_entries[0][1] if child_entries else 1)
     if tenant.owner_number:
         send_text(tenant, normalize_number(tenant.owner_number),
             f"\U0001f514 *New Queue Entry*\n\n"
-            f"\U0001f464 {customer_name}\n"
+            f"\U0001f464 {report_name}\n"
             f"\U0001f4bc {service.name if service else ''}\n"
             f"\U0001f477 {agent.name if agent else ''}\n"
-            f"\U0001f4cd Position #{position} | \u23f0 {format_eta(eta)}"
+            f"\U0001f4cd Position #{report_position} | \u23f0 {format_eta(eta)}"
         )
 
 
@@ -680,7 +708,7 @@ async def handle_webhook(request: Request):
     print(f"\U0001f4e9 [{tenant.business_name}] {customer_num} | {state} | \'{text}\'")
 
     # ── GLOBAL TRIGGERS (work from any state) ─────────────────────────────
-    if any(w in text for w in ["menu","start","hi","hello","hey"]) and state not in ["awaiting_children"]:
+    if any(w in text for w in ["menu","start","hi","hello","hey"]) and state not in ["awaiting_booking_for", "awaiting_children", "awaiting_children_names"]:
         set_session(tenant.id, customer_num, {"state": "main_menu"})
         send_main_menu(tenant, customer_num)
         return {"status": "success"}
@@ -733,17 +761,9 @@ async def handle_webhook(request: Request):
             else:
                 set_session(tenant.id, customer_num, {"state": "main_menu"})
                 send_main_menu(tenant, customer_num)
-        elif state == "awaiting_children":
-            # Back means cancel the whole booking — already saved, so cancel it
-            entry_id = sess.get("entry_id")
-            if entry_id:
-                with Session(engine) as s:
-                    entry = s.get(QueueEntry, entry_id)
-                    if entry:
-                        entry.status = "Cancelled"
-                        s.add(entry)
-                        s.commit()
-            set_session(tenant.id, customer_num, {"state": "main_menu"})
+        elif state in ("awaiting_booking_for", "awaiting_children", "awaiting_children_names"):
+            # Nothing saved yet — just cancel and return to main menu
+            clear_session(tenant.id, customer_num)
             send_text(tenant, customer_num,
                 "\u274c Booking cancelled.\n\nReply *menu* to start again."
             )
@@ -1050,8 +1070,20 @@ async def handle_webhook(request: Request):
                     "auto_assigned": True,
                     "auto_agent_id": agents[0]["id"],
                 })
-                # Trigger assignment immediately
-                _do_assign(tenant, customer_num, customer_name, agents[0]["id"], chosen_service_id, queue_date, sess)
+                # Ask who we're booking for before saving the entry
+                set_session(tenant.id, customer_num, {
+                    "state": "awaiting_booking_for",
+                    "pending_agent_id": agents[0]["id"],
+                    "pending_service_id": chosen_service_id,
+                    "pending_queue_date": queue_date,
+                })
+                send_text(tenant, customer_num,
+                    "Who are you booking for?\n"
+                    "1\ufe0f\u20e3 Just me\n"
+                    "2\ufe0f\u20e3 Me and my children\n"
+                    "3\ufe0f\u20e3 My children only\n\n"
+                    "Reply *1*, *2*, or *3*"
+                )
             else:
                 set_session(tenant.id, customer_num, {
                     "state": "awaiting_agent",
@@ -1104,25 +1136,71 @@ async def handle_webhook(request: Request):
                     f"Sorry, no {tenant.agent_label.lower()}s available. Reply *0* to go back.")
                 return {"status": "success"}
 
-            _do_assign(tenant, customer_num, customer_name, assigned_agent_id, service_id, queue_date, sess)
+            set_session(tenant.id, customer_num, {
+                "state": "awaiting_booking_for",
+                "pending_agent_id": assigned_agent_id,
+                "pending_service_id": service_id,
+                "pending_queue_date": queue_date,
+            })
+            send_text(tenant, customer_num,
+                "Who are you booking for?\n"
+                "1\ufe0f\u20e3 Just me\n"
+                "2\ufe0f\u20e3 Me and my children\n"
+                "3\ufe0f\u20e3 My children only\n\n"
+                "Reply *1*, *2*, or *3*"
+            )
         else:
             send_text(tenant, customer_num,
                 f"Please reply with a number, or *0* to go back.")
         return {"status": "success"}
 
-    # ── CHILDREN / ADDITIONAL NAMES ───────────────────────────────────────
-    if state == "awaiting_children":
-        entry_id = sess.get("entry_id")
-        if text == "0" or text in ["no", "nope", "skip", "none"]:
-            clear_session(tenant.id, customer_num)
+    # ── WHO ARE WE BOOKING FOR? ────────────────────────────────────────────
+    if state == "awaiting_booking_for":
+        pending_agent_id   = sess.get("pending_agent_id")
+        pending_service_id = sess.get("pending_service_id")
+        pending_queue_date = sess.get("pending_queue_date", today_str())
+
+        if text == "1":
+            # Just the parent — book immediately
+            _do_assign(tenant, customer_num, customer_name,
+                       pending_agent_id, pending_service_id, pending_queue_date, sess,
+                       include_parent=True, children_names=[])
+        elif text in ("2", "3"):
+            include_parent = (text == "2")
+            set_session(tenant.id, customer_num, {
+                "state": "awaiting_children",
+                "pending_agent_id": pending_agent_id,
+                "pending_service_id": pending_service_id,
+                "pending_queue_date": pending_queue_date,
+                "include_parent": include_parent,
+            })
             send_text(tenant, customer_num,
-                "\u2705 All done! Reply *status* to check your position anytime."
+                "How many children are you booking for?\n"
+                "1\ufe0f\u20e3 1 child\n"
+                "2\ufe0f\u20e3 2 children\n\n"
+                "Reply *1* or *2*"
             )
-        elif text.isdigit() and 1 <= int(text) <= 2:
+        else:
+            send_text(tenant, customer_num,
+                "Please reply *1* (just me), *2* (me + children), or *3* (children only)."
+            )
+        return {"status": "success"}
+
+    # ── HOW MANY CHILDREN? ────────────────────────────────────────────────
+    if state == "awaiting_children":
+        pending_agent_id   = sess.get("pending_agent_id")
+        pending_service_id = sess.get("pending_service_id")
+        pending_queue_date = sess.get("pending_queue_date", today_str())
+        include_parent     = sess.get("include_parent", True)
+
+        if text.isdigit() and 1 <= int(text) <= 2:
             count = int(text)
             set_session(tenant.id, customer_num, {
                 "state": "awaiting_children_names",
-                "entry_id": entry_id,
+                "pending_agent_id": pending_agent_id,
+                "pending_service_id": pending_service_id,
+                "pending_queue_date": pending_queue_date,
+                "include_parent": include_parent,
                 "children_count": count,
                 "children_collected": [],
             })
@@ -1131,21 +1209,27 @@ async def handle_webhook(request: Request):
             )
         else:
             send_text(tenant, customer_num,
-                "Reply *1* or *2* for the number of children, or *0* to skip."
+                "Reply *1* for 1 child or *2* for 2 children."
             )
         return {"status": "success"}
 
     # ── COLLECTING CHILDREN NAMES ─────────────────────────────────────────
     if state == "awaiting_children_names":
-        entry_id          = sess.get("entry_id")
-        count             = sess.get("children_count", 1)
-        collected         = sess.get("children_collected", [])
+        pending_agent_id   = sess.get("pending_agent_id")
+        pending_service_id = sess.get("pending_service_id")
+        pending_queue_date = sess.get("pending_queue_date", today_str())
+        include_parent     = sess.get("include_parent", True)
+        count              = sess.get("children_count", 1)
+        collected          = sess.get("children_collected", [])
         collected.append(raw_text.strip())
 
         if len(collected) < count:
             set_session(tenant.id, customer_num, {
                 "state": "awaiting_children_names",
-                "entry_id": entry_id,
+                "pending_agent_id": pending_agent_id,
+                "pending_service_id": pending_service_id,
+                "pending_queue_date": pending_queue_date,
+                "include_parent": include_parent,
                 "children_count": count,
                 "children_collected": collected,
             })
@@ -1153,19 +1237,10 @@ async def handle_webhook(request: Request):
                 f"Name of child {len(collected) + 1} of {count}:"
             )
         else:
-            # Save names to the entry
-            names_str = ", ".join(collected)
-            with Session(engine) as s:
-                entry = s.get(QueueEntry, entry_id)
-                if entry:
-                    entry.additional_names = names_str
-                    s.add(entry)
-                    s.commit()
-            clear_session(tenant.id, customer_num)
-            send_text(tenant, customer_num,
-                f"\u2705 Got it! Added {names_str} to your booking.\n\n"
-                f"Reply *status* to check your position anytime."
-            )
+            # All names collected — save all entries now
+            _do_assign(tenant, customer_num, customer_name,
+                       pending_agent_id, pending_service_id, pending_queue_date, sess,
+                       include_parent=include_parent, children_names=collected)
         return {"status": "success"}
 
     # ── FALLBACK ──────────────────────────────────────────────────────────
