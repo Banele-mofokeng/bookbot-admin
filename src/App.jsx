@@ -9,10 +9,10 @@ import TenantForm from './pages/TenantForm.jsx'
 import { api } from './api/client.js'
 
 const PAGE_TITLES = {
-  '/':            'Queue',
-  '/services':    'Services',
-  '/agents':      'Agents',
-  '/businesses':  'Businesses',
+  '/':                     'Queue',
+  '/services':             'Services',
+  '/agents':               'Agents',
+  '/admin/businesses':     'Businesses',
 }
 
 function HamburgerIcon() {
@@ -85,9 +85,9 @@ export default function App() {
             <Route path="/"                    element={<Queue      tenants={tenants} />} />
             <Route path="/services"            element={<Services   tenants={tenants} />} />
             <Route path="/agents"              element={<Agents     tenants={tenants} />} />
-            <Route path="/businesses"          element={<Tenants    tenants={tenants} reload={loadTenants} />} />
-            <Route path="/businesses/new"      element={<TenantForm tenants={tenants} reload={loadTenants} />} />
-            <Route path="/businesses/:id/edit" element={<TenantForm tenants={tenants} reload={loadTenants} />} />
+            <Route path="/admin/businesses"          element={<Tenants    tenants={tenants} reload={loadTenants} />} />
+            <Route path="/admin/businesses/new"      element={<TenantForm tenants={tenants} reload={loadTenants} />} />
+            <Route path="/admin/businesses/:id/edit" element={<TenantForm tenants={tenants} reload={loadTenants} />} />
           </Routes>
         )}
       </main>

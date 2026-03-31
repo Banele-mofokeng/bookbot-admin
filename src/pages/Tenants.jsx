@@ -31,7 +31,7 @@ export default function Tenants({ tenants, reload }) {
           </p>
         </div>
         <div className="page-header-actions">
-          <Button onClick={() => navigate('/businesses/new')}>+ Add Business</Button>
+          <Button onClick={() => navigate('/admin/businesses/new')}>+ Add Business</Button>
         </div>
       </div>
 
@@ -72,7 +72,7 @@ export default function Tenants({ tenants, reload }) {
                 <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
                   <Button
                     variant="ghost" size="sm"
-                    onClick={() => navigate(`/businesses/${t.id}/edit`)}
+                    onClick={() => navigate(`/admin/businesses/${t.id}/edit`)}
                   >
                     Edit
                   </Button>

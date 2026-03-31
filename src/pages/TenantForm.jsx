@@ -140,7 +140,7 @@ export default function TenantForm({ tenants, reload }) {
         show('Business registered!', 'success')
       }
       await reload()
-      navigate('/businesses')
+      navigate('/admin/businesses')
     } catch (err) {
       show(err.message || 'Failed to save.', 'error')
     } finally {
@@ -239,7 +239,7 @@ export default function TenantForm({ tenants, reload }) {
           <Button onClick={submit} loading={saving}>
             {isEdit ? 'Save Changes' : 'Register Business'}
           </Button>
-          <Button variant="ghost" onClick={() => navigate('/businesses')}>Cancel</Button>
+          <Button variant="ghost" onClick={() => navigate('/admin/businesses')}>Cancel</Button>
         </div>
       </Card>
 
