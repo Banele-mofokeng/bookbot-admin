@@ -23,14 +23,16 @@ export default function Tenants({ tenants, reload }) {
 
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 28 }}>
+      <div className="page-header">
         <div>
           <h1 style={{ fontSize: 22, fontWeight: 800, letterSpacing: '-0.01em' }}>Businesses</h1>
           <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 4 }}>
             {tenants.length} registered {tenants.length === 1 ? 'business' : 'businesses'}
           </p>
         </div>
-        <Button onClick={() => navigate('/businesses/new')}>+ Add Business</Button>
+        <div className="page-header-actions">
+          <Button onClick={() => navigate('/businesses/new')}>+ Add Business</Button>
+        </div>
       </div>
 
       {tenants.length === 0 ? (

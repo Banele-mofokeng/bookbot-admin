@@ -124,6 +124,16 @@ class QueueEntry(SQLModel, table=True):
 
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
+    # Add new columns to existing tables if they don't exist yet (SQLite migration)
+    with engine.connect() as conn:
+        existing = [row[1] for row in conn.execute(
+            __import__("sqlalchemy").text("PRAGMA table_info(queueentry)")
+        ).fetchall()]
+        if "parent_entry_id" not in existing:
+            conn.execute(__import__("sqlalchemy").text(
+                "ALTER TABLE queueentry ADD COLUMN parent_entry_id INTEGER"
+            ))
+            conn.commit()
 
 
 # =============================================================================
@@ -145,8 +155,7 @@ app.add_middleware(
 async def on_startup():
     print("🚀 QueueBot starting...")
     create_db_and_tables()
-    scheduler.add_job(notification_job,  "interval", minutes=2,  id="notifications")
-    scheduler.add_job(midnight_reset_job, "cron",    hour=0, minute=1, id="midnight_reset")
+    scheduler.add_job(midnight_reset_job, "cron", hour=0, minute=1, id="midnight_reset")
     scheduler.start()
     print("✅ DB ready. Scheduler running.")
 
@@ -464,80 +473,105 @@ def get_notify_number(entry) -> str:
     return entry.customer_number
 
 
-def send_position_notification(tenant, entry, ahead_count: int, s):
-    """Position-aware notification — fires based on how many people are ahead on same agent."""
-    notify_to = get_notify_number(entry)
-    if not notify_to:
-        return  # walk-in with no phone
+def _notify_job_id(agent_id: int, queue_date: str) -> str:
+    return f"notify_next_{agent_id}_{queue_date}"
 
-    agent      = s.get(Agent, entry.agent_id)
-    service    = s.get(Service, entry.service_id)
-    svc_name   = service.name if service else ""
-    agent_name = agent.name if agent else tenant.agent_label
-    eta        = format_eta(entry.estimated_start)
 
-    if ahead_count == 0 and not entry.notified_next:
-        send_text(tenant, notify_to,
-            f"\U0001f680 *You're up next at {tenant.business_name}!*\n\n"
-            f"Head over now \u2014 {agent_name} is ready for you.\n"
-            f"\U0001f4bc {svc_name}"
-        )
-        entry.notified_next    = True
-        entry.notified_two_away = True
-        s.add(entry)
+def _schedule_15min_warning(tenant_id: int, agent_id: int, queue_date: str, duration_minutes: int):
+    """
+    Called when an entry goes InService.
+    Schedules a one-shot job to warn the next waiter 15 minutes before this service ends.
+    """
+    delay = max(1, duration_minutes - 15)
+    fire_at = now() + timedelta(minutes=delay)
+    job_id = _notify_job_id(agent_id, queue_date)
+    try:
+        scheduler.remove_job(job_id)
+    except Exception:
+        pass
+    scheduler.add_job(
+        _fire_15min_warning,
+        "date",
+        run_date=fire_at,
+        args=[tenant_id, agent_id, queue_date],
+        id=job_id,
+    )
+    print(f"\U0001f4e5 15-min warning scheduled for agent {agent_id} at {fire_at.strftime('%H:%M')}")
 
-    elif ahead_count == 1 and not entry.notified_two_away:
+
+async def _fire_15min_warning(tenant_id: int, agent_id: int, queue_date: str):
+    """Fires ~15 min before the current InService person finishes — warns the next waiter."""
+    with Session(engine) as s:
+        tenant = s.get(Tenant, tenant_id)
+        if not tenant:
+            return
+        next_entry = s.exec(
+            select(QueueEntry).where(
+                QueueEntry.agent_id   == agent_id,
+                QueueEntry.tenant_id  == tenant_id,
+                QueueEntry.queue_date == queue_date,
+                QueueEntry.status     == "Waiting",
+            ).order_by(QueueEntry.joined_at)
+        ).first()
+        if not next_entry or next_entry.notified_two_away:
+            return
+        notify_to = get_notify_number(next_entry)
+        if not notify_to:
+            return
+        agent   = s.get(Agent, next_entry.agent_id)
+        service = s.get(Service, next_entry.service_id)
         send_text(tenant, notify_to,
             f"\u23f3 *Almost your turn at {tenant.business_name}!*\n\n"
-            f"There is *1 person* ahead of you.\n"
-            f"Estimated time: *{eta}*\n\n"
+            f"You\'re up in about *15 minutes*.\n"
+            f"\U0001f4bc {service.name if service else ''} with {agent.name if agent else tenant.agent_label}\n\n"
             f"Start making your way over \U0001f6b6"
         )
-        entry.notified_two_away = True
-        s.add(entry)
-
-    elif ahead_count == 2 and not entry.notified_two_away:
-        send_text(tenant, notify_to,
-            f"\u23f3 *Heads up from {tenant.business_name}!*\n\n"
-            f"There are *2 people* ahead of you.\n"
-            f"Estimated time: *{eta}*\n\n"
-            f"Start making your way over \U0001f6b6"
-        )
-        entry.notified_two_away = True
-        s.add(entry)
+        next_entry.notified_two_away = True
+        s.add(next_entry)
+        s.commit()
 
 
-async def notification_job():
-    """Runs every 2 minutes. Sends position-aware notifications scoped per agent."""
-    print("\U0001f514 Running notification check...")
-    today = today_str()
+def _fire_youre_next(tenant_id: int, agent_id: int, queue_date: str):
+    """
+    Called when an entry is marked Done / NoShow / Cancelled.
+    Cancels any pending 15-min job and immediately tells the next waiter they're up.
+    """
+    # Cancel the pending 15-min warning — the InService person is already done
+    try:
+        scheduler.remove_job(_notify_job_id(agent_id, queue_date))
+    except Exception:
+        pass
 
     with Session(engine) as s:
-        waiting = s.exec(
+        tenant = s.exec(
+            select(Tenant).where(Tenant.id == tenant_id)
+        ).first()
+        if not tenant:
+            return
+        next_entry = s.exec(
             select(QueueEntry).where(
-                QueueEntry.queue_date == today,
-                QueueEntry.status     == "Waiting"
-            )
-        ).all()
-
-        for entry in waiting:
-            tenant = s.get(Tenant, entry.tenant_id)
-            if not tenant:
-                continue
-            # Count Waiting entries ahead on the SAME AGENT — not globally
-            ahead = s.exec(
-                select(QueueEntry).where(
-                    QueueEntry.agent_id   == entry.agent_id,
-                    QueueEntry.tenant_id  == entry.tenant_id,
-                    QueueEntry.queue_date == today,
-                    QueueEntry.status     == "Waiting",
-                    QueueEntry.joined_at  < entry.joined_at
-                )
-            ).all()
-            send_position_notification(tenant, entry, len(ahead), s)
-
+                QueueEntry.agent_id   == agent_id,
+                QueueEntry.tenant_id  == tenant_id,
+                QueueEntry.queue_date == queue_date,
+                QueueEntry.status     == "Waiting",
+            ).order_by(QueueEntry.joined_at)
+        ).first()
+        if not next_entry or next_entry.notified_next:
+            return
+        notify_to = get_notify_number(next_entry)
+        if not notify_to:
+            return
+        agent   = s.get(Agent, next_entry.agent_id)
+        service = s.get(Service, next_entry.service_id)
+        send_text(tenant, notify_to,
+            f"\U0001f680 *You\'re up next at {tenant.business_name}!*\n\n"
+            f"Head over now \u2014 {agent.name if agent else tenant.agent_label} is ready for you.\n"
+            f"\U0001f4bc {service.name if service else ''}"
+        )
+        next_entry.notified_next    = True
+        next_entry.notified_two_away = True
+        s.add(next_entry)
         s.commit()
-    print("\U0001f514 Notification check done.")
 
 async def midnight_reset_job():
     """Runs at 00:01 every night. Closes out yesterday's queue."""
@@ -861,40 +895,43 @@ async def handle_webhook(request: Request):
         elif text == "2":
             today = today_str()
             with Session(engine) as s:
-                entry = s.exec(
+                entries = s.exec(
                     select(QueueEntry).where(
-                        QueueEntry.tenant_id      == tenant.id,
+                        QueueEntry.tenant_id       == tenant.id,
                         QueueEntry.customer_number == customer_num,
                         QueueEntry.queue_date      >= today,
                         QueueEntry.status.in_(["Waiting", "InService"])
-                    ).order_by(QueueEntry.queue_date, QueueEntry.joined_at)
-                ).first()
+                    ).order_by(QueueEntry.queue_date, QueueEntry.position)
+                ).all()
 
-                if not entry:
+                if not entries:
                     send_text(tenant, customer_num, "You\'re not currently in the queue.\n\nReply *menu* to join.")
                 else:
-                    agent   = s.get(Agent, entry.agent_id)
-                    service = s.get(Service, entry.service_id)
+                    agent   = s.get(Agent, entries[0].agent_id)
+                    service = s.get(Service, entries[0].service_id)
                     ahead   = s.exec(
                         select(QueueEntry).where(
-                            QueueEntry.agent_id   == entry.agent_id,
+                            QueueEntry.agent_id   == entries[0].agent_id,
                             QueueEntry.tenant_id  == tenant.id,
-                            QueueEntry.queue_date == entry.queue_date,
+                            QueueEntry.queue_date == entries[0].queue_date,
                             QueueEntry.status     == "Waiting",
-                            QueueEntry.joined_at  < entry.joined_at
+                            QueueEntry.position   < entries[0].position
                         )
                     ).all()
                     ahead_count = len(ahead)
-                    add_note    = entry.additional_names
-                    add_line    = f"\n\U0001f465 Also for: {add_note}" if add_note else ""
+
+                    # Build position lines for all people in this booking
+                    position_lines = ""
+                    for e in entries:
+                        position_lines += f"\U0001f522 *{e.customer_name}:* #{e.position}\n"
+
                     send_text(tenant, customer_num,
                         f"*Your Queue Status* \U0001f4cd\n\n"
-                        f"\U0001f522 Position: #{entry.position}\n"
+                        f"{position_lines}"
                         f"\U0001f464 {tenant.agent_label}: {agent.name if agent else 'TBD'}\n"
                         f"\U0001f4bc {tenant.service_label}: {service.name if service else 'TBD'}\n"
-                        f"\u23f0 Estimated time: {format_eta(entry.estimated_start)}\n"
-                        f"\U0001f465 People ahead: {ahead_count}"
-                        f"{add_line}\n\n"
+                        f"\u23f0 Estimated time: {format_eta(entries[0].estimated_start)}\n"
+                        f"\U0001f465 People ahead: {ahead_count}\n\n"
                         f"Reply *menu* for more options."
                     )
             clear_session(tenant.id, customer_num)
@@ -1355,11 +1392,21 @@ def update_entry_status(entry_id: int, body: Dict[str, Any]):
         agent_id   = entry.agent_id
         tenant_id  = entry.tenant_id
         queue_date = entry.queue_date
+        service_id = entry.service_id
         entry.status = new_status
         s.add(entry)
         s.commit()
 
     recalculate_queue(tenant_id, agent_id, queue_date)
+
+    if new_status == "InService":
+        with Session(engine) as s:
+            svc = s.get(Service, service_id)
+            duration = svc.duration_minutes if svc else 60
+        _schedule_15min_warning(tenant_id, agent_id, queue_date, duration)
+    elif new_status in ("Done", "NoShow", "Cancelled"):
+        _fire_youre_next(tenant_id, agent_id, queue_date)
+
     return {"status": "updated", "entry_id": entry_id, "new_status": new_status}
 
 

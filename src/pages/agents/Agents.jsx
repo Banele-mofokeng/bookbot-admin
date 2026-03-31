@@ -96,18 +96,20 @@ export default function Agents({ tenants }) {
 
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 28 }}>
+      <div className="page-header">
         <div>
           <h1 style={{ fontSize: 22, fontWeight: 800 }}>{tenant?.agent_label || 'Agent'}s</h1>
           <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 4 }}>
             {tenant ? `${tenant.agent_label}s at ${tenant.business_name}` : ''}
           </p>
         </div>
-        <div style={{ display: 'flex', gap: 10 }}>
-          <select value={selectedTenantId || ''} onChange={e => setSelectedTenantId(parseInt(e.target.value))}
-            style={{ background: 'var(--surface2)', border: '1px solid var(--border2)', borderRadius: 8, padding: '8px 14px', fontSize: 13, color: 'var(--text)', fontFamily: 'var(--sans)', fontWeight: 600, outline: 'none', cursor: 'pointer' }}>
-            {tenants.map(t => <option key={t.id} value={t.id}>{t.business_name}</option>)}
-          </select>
+        <div className="page-header-actions">
+          {tenants.length > 1 && (
+            <select value={selectedTenantId || ''} onChange={e => setSelectedTenantId(parseInt(e.target.value))}
+              style={{ background: 'var(--surface2)', border: '1px solid var(--border2)', borderRadius: 8, padding: '8px 14px', fontSize: 13, color: 'var(--text)', fontFamily: 'var(--sans)', fontWeight: 600, outline: 'none', cursor: 'pointer' }}>
+              {tenants.map(t => <option key={t.id} value={t.id}>{t.business_name}</option>)}
+            </select>
+          )}
           <Button onClick={() => { setAdding(true); setEditing(null) }}
             disabled={services.filter(s => s.is_active).length === 0}>
             + Add {tenant?.agent_label || 'Agent'}
@@ -159,7 +161,7 @@ export default function Agents({ tenants }) {
                       </div>
                     </div>
                   </div>
-                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <div className="card-row-actions">
                     <Badge color={agent.is_active ? 'green' : 'gray'}>{agent.is_active ? 'Active' : 'Inactive'}</Badge>
                     <Button variant="ghost" size="sm" onClick={() => setEditing(agent.id)}>Edit</Button>
                     <Button variant={agent.is_active ? 'danger' : 'outline'} size="sm" onClick={() => toggleActive(agent)}>

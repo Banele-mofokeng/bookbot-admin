@@ -22,6 +22,8 @@
   --mono:       'DM Mono', monospace;
   --radius:     10px;
   --radius-lg:  14px;
+  --sidebar-w:  220px;
+  --topbar-h:   56px;
 }
 
 body {
@@ -35,7 +37,7 @@ body {
 button { font-family: var(--sans); cursor: pointer; }
 input, select, textarea { font-family: var(--sans); }
 
-::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
 
@@ -43,12 +45,10 @@ input, select, textarea { font-family: var(--sans); }
   from { opacity: 0; transform: translateY(10px); }
   to   { opacity: 1; transform: translateY(0); }
 }
-
 @keyframes fadeIn {
   from { opacity: 0; }
   to   { opacity: 1; }
 }
-
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50%       { opacity: 0.35; }
@@ -57,3 +57,293 @@ input, select, textarea { font-family: var(--sans); }
 .animate-fade-up { animation: fadeUp 0.35s ease both; }
 .animate-fade-in { animation: fadeIn 0.25s ease both; }
 .pulse { animation: pulse 1.5s ease infinite; }
+
+/* ── App Layout ──────────────────────────────────────────────────────────── */
+.app-layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────────── */
+.sidebar {
+  width: var(--sidebar-w);
+  min-height: 100vh;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  top: 0; left: 0; bottom: 0;
+  z-index: 200;
+  transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.28s ease;
+  overflow-y: auto;
+}
+
+.sidebar-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: 199;
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+  animation: fadeIn 0.2s ease;
+}
+
+/* ── Mobile top bar ──────────────────────────────────────────────────────── */
+.mobile-topbar {
+  display: none;
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: var(--topbar-h);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  z-index: 198;
+}
+
+.mobile-topbar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.hamburger {
+  background: none;
+  border: none;
+  color: var(--text);
+  padding: 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  border-radius: 8px;
+  transition: background 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.hamburger:hover,
+.hamburger:active { background: var(--surface2); }
+
+/* ── Main content ────────────────────────────────────────────────────────── */
+.main-content {
+  margin-left: var(--sidebar-w);
+  flex: 1;
+  padding: 32px 36px;
+  min-height: 100vh;
+  min-width: 0;
+}
+
+/* ── Page header ─────────────────────────────────────────────────────────── */
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 28px;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.page-header-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* ── Stats grid ──────────────────────────────────────────────────────────── */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+  margin-bottom: 28px;
+}
+
+/* ── Table wrapper (horizontal scroll on small screens) ─────────────────── */
+.table-wrap {
+  overflow-x: auto;
+}
+
+.queue-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+/* ── Service form ────────────────────────────────────────────────────────── */
+.service-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 140px auto auto;
+  gap: 12px;
+  align-items: end;
+}
+
+/* ── Walk-in modal card ──────────────────────────────────────────────────── */
+.walkin-modal-card {
+  width: 460px;
+  padding: 28px;
+  max-height: 90vh;
+  overflow-y: auto;
+}
+
+/* ── Tenant / agent card actions ─────────────────────────────────────────── */
+.card-row-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+/* ── Form page layout ────────────────────────────────────────────────────── */
+.form-page {
+  max-width: 560px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   TABLET  769px – 1024px
+═══════════════════════════════════════════════════════════════════════════ */
+@media (min-width: 769px) and (max-width: 1024px) {
+  :root { --sidebar-w: 200px; }
+
+  .main-content {
+    padding: 24px 22px;
+  }
+
+  .stats-grid {
+    gap: 12px;
+  }
+
+  .page-header {
+    margin-bottom: 20px;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MOBILE  ≤ 768px
+═══════════════════════════════════════════════════════════════════════════ */
+@media (max-width: 768px) {
+  /* Sidebar becomes off-canvas drawer */
+  .sidebar {
+    transform: translateX(-100%);
+    width: 270px;
+    box-shadow: none;
+  }
+  .sidebar.sidebar-open {
+    transform: translateX(0);
+    box-shadow: 24px 0 64px rgba(0, 0, 0, 0.6);
+  }
+  .sidebar-overlay.sidebar-open {
+    display: block;
+  }
+
+  /* Show mobile top bar */
+  .mobile-topbar {
+    display: flex;
+  }
+
+  /* Shift main content down to clear the topbar */
+  .main-content {
+    margin-left: 0;
+    padding: calc(var(--topbar-h) + 20px) 16px 32px;
+  }
+
+  /* Page header stacks vertically */
+  .page-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  .page-header-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  /* Stats: keep 3 columns but tighter */
+  .stats-grid {
+    gap: 10px;
+    margin-bottom: 18px;
+  }
+
+  /* ── Queue table → card layout ──────────────────────────────────── */
+  .queue-table thead {
+    display: none;
+  }
+  .queue-table tbody tr {
+    display: block;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 10px;
+    padding: 12px 14px;
+    background: var(--surface);
+    transition: background 0.12s;
+  }
+  .queue-table td {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 5px 0;
+    border: none !important;
+    background: transparent !important;
+  }
+  /* Divider after the position row */
+  .queue-table td.td-pos {
+    border-bottom: 1px solid var(--border) !important;
+    padding-bottom: 9px;
+    margin-bottom: 4px;
+  }
+  /* Label injected from data-label attribute */
+  .queue-table td[data-label]::before {
+    content: attr(data-label);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 500;
+    flex-shrink: 0;
+    margin-right: 12px;
+  }
+  /* Actions cell: no label, full-width row */
+  .queue-table td.td-actions {
+    padding-top: 10px;
+    margin-top: 4px;
+    border-top: 1px solid var(--border) !important;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .queue-table td.td-actions::before {
+    display: none;
+  }
+
+  /* Hide less critical columns on mobile */
+  .td-hide-mobile {
+    display: none !important;
+  }
+
+  /* Service form: stack inputs */
+  .service-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  /* Walk-in modal: near full-screen */
+  .walkin-modal-card {
+    width: calc(100vw - 32px);
+    padding: 20px 18px;
+    max-height: 88vh;
+  }
+
+  /* Card row actions: wrap on very small screens */
+  .card-row-actions {
+    flex-wrap: wrap;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   VERY SMALL  ≤ 400px
+═══════════════════════════════════════════════════════════════════════════ */
+@media (max-width: 400px) {
+  .stats-grid {
+    grid-template-columns: 1fr;
+  }
+}
