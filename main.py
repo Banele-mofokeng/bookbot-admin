@@ -124,11 +124,13 @@ class QueueEntry(SQLModel, table=True):
 
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
-    # Add new columns to existing tables if they don't exist yet (SQLite migration)
+    # Add new columns to existing tables if they don't exist yet (PostgreSQL migration)
     with engine.connect() as conn:
-        existing = [row[1] for row in conn.execute(
-            __import__("sqlalchemy").text("PRAGMA table_info(queueentry)")
-        ).fetchall()]
+        result = conn.execute(__import__("sqlalchemy").text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'queueentry'"
+        ))
+        existing = [row[0] for row in result.fetchall()]
         if "parent_entry_id" not in existing:
             conn.execute(__import__("sqlalchemy").text(
                 "ALTER TABLE queueentry ADD COLUMN parent_entry_id INTEGER"
