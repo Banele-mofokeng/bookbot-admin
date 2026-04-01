@@ -116,6 +116,7 @@ class QueueEntry(SQLModel, table=True):
     booked_via: str            = "whatsapp"          # whatsapp | walkin
     queue_date: str                                  # "2026-03-18" — ISO date string
     estimated_start: Optional[datetime] = None       # calculated ETA
+    earliest_arrival: Optional[datetime] = None      # customer's declared arrival time
     position: int              = 0                   # display position in full queue
     notified_two_away: bool    = False
     notified_next: bool        = False
@@ -134,6 +135,11 @@ def create_db_and_tables():
         if "parent_entry_id" not in existing:
             conn.execute(__import__("sqlalchemy").text(
                 "ALTER TABLE queueentry ADD COLUMN parent_entry_id INTEGER"
+            ))
+            conn.commit()
+        if "earliest_arrival" not in existing:
+            conn.execute(__import__("sqlalchemy").text(
+                "ALTER TABLE queueentry ADD COLUMN earliest_arrival TIMESTAMP"
             ))
             conn.commit()
 
@@ -227,12 +233,34 @@ def get_agent_backlog_minutes(agent_id: int, tenant_id: int, queue_date: str,
 
 
 def calculate_estimated_start(tenant: Tenant, agent_id: int,
-                               queue_date: str, backlog_minutes: int) -> datetime:
+                               queue_date: str, backlog_minutes: int,
+                               earliest_arrival: Optional[datetime] = None) -> datetime:
     """Convert backlog minutes into an actual datetime."""
     opens = datetime.strptime(
         f"{queue_date} {tenant.queue_opens:02d}:00", "%Y-%m-%d %H:%M"
     )
-    return opens + timedelta(minutes=backlog_minutes)
+    calculated = opens + timedelta(minutes=backlog_minutes)
+    # Never show an ETA in the past — clamp to current time
+    result = max(calculated, now())
+    # Respect customer's declared arrival time
+    if earliest_arrival:
+        result = max(result, earliest_arrival)
+    return result
+
+
+def parse_arrival_time(text: str, queue_date: str) -> Optional[datetime]:
+    """Parse 'now', 'HH:MM', or 'HHMM' into a datetime on queue_date."""
+    t = text.strip().lower()
+    if t == "now":
+        return now()
+    for fmt in ("%H:%M", "%H%M"):
+        try:
+            parsed = datetime.strptime(t, fmt)
+            base   = datetime.strptime(queue_date, "%Y-%m-%d")
+            return base.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0)
+        except ValueError:
+            continue
+    return None
 
 
 def assign_agent(tenant: Tenant, service_id: int,
@@ -318,9 +346,9 @@ def recalculate_queue(tenant_id: int, agent_id: int, queue_date: str):
                 # Frozen — don't recalculate, just add their duration to the running total
                 running_minutes += duration
             else:
-                # Recalculate
+                # Recalculate — honour the customer's declared arrival time
                 entry.estimated_start = calculate_estimated_start(
-                    tenant, agent_id, queue_date, running_minutes
+                    tenant, agent_id, queue_date, running_minutes, entry.earliest_arrival
                 )
                 s.add(entry)
                 running_minutes += duration
@@ -604,7 +632,8 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
                assigned_agent_id: int, service_id: int,
                queue_date: str, sess: dict,
                include_parent: bool = True,
-               children_names: list = None):
+               children_names: list = None,
+               earliest_arrival: Optional[datetime] = None):
     """
     Saves queue entries and sends confirmation.
     include_parent=False means only child entries are created (parent is just escorting).
@@ -615,58 +644,88 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
         children_names = []
 
     backlog  = get_agent_backlog_minutes(assigned_agent_id, tenant.id, queue_date)
-    eta      = calculate_estimated_start(tenant, assigned_agent_id, queue_date, backlog)
+    eta      = calculate_estimated_start(tenant, assigned_agent_id, queue_date, backlog, earliest_arrival)
 
     print(f"\U0001f4be Saving entry | tenant={tenant.id} service={service_id} agent={assigned_agent_id} date={queue_date} parent={include_parent} children={children_names}")
 
+    child_entries = []
+    parent_entry  = None
+    agent         = None
+    saved_ids     = []  # track all saved entry IDs for rollback
+    try:
+        with Session(engine) as s:
+            total_waiting = len(s.exec(
+                select(QueueEntry).where(
+                    QueueEntry.tenant_id  == tenant.id,
+                    QueueEntry.queue_date == queue_date,
+                    QueueEntry.status     == "Waiting"
+                )
+            ).all())
+            next_position = total_waiting + 1
+
+            if include_parent:
+                parent_entry = QueueEntry(
+                    tenant_id          = tenant.id,
+                    service_id         = service_id,
+                    agent_id           = assigned_agent_id,
+                    customer_number    = customer_num,
+                    customer_name      = customer_name,
+                    queue_date         = queue_date,
+                    estimated_start    = eta,
+                    earliest_arrival   = earliest_arrival,
+                    position           = next_position,
+                    booked_via         = "whatsapp"
+                )
+                s.add(parent_entry)
+                s.commit()
+                s.refresh(parent_entry)
+                saved_ids.append(parent_entry.id)
+                next_position += 1
+
+            for child_name in children_names:
+                # Assign each child independently so free agents are used and
+                # backlogs are accurate after each commit
+                child_agent_id = assign_agent(tenant, service_id, None, queue_date) or assigned_agent_id
+                child_backlog  = get_agent_backlog_minutes(child_agent_id, tenant.id, queue_date)
+                child_eta      = calculate_estimated_start(tenant, child_agent_id, queue_date, child_backlog, earliest_arrival)
+                child_entry = QueueEntry(
+                    tenant_id          = tenant.id,
+                    service_id         = service_id,
+                    agent_id           = child_agent_id,
+                    customer_number    = customer_num,
+                    customer_name      = child_name,
+                    queue_date         = queue_date,
+                    estimated_start    = child_eta,
+                    position           = next_position,
+                    booked_via         = "whatsapp",
+                    parent_entry_id    = parent_entry.id if parent_entry else None,
+                    earliest_arrival   = earliest_arrival,
+                )
+                s.add(child_entry)
+                s.commit()  # commit before next child so backlog recalculates correctly
+                s.refresh(child_entry)
+                saved_ids.append(child_entry.id)
+                child_entries.append((child_name, next_position, child_agent_id, child_eta))
+                next_position += 1
+
+            agent = s.get(Agent, assigned_agent_id)
+
+    except Exception as exc:
+        print(f"❌ _do_assign failed — rolling back {len(saved_ids)} entries: {exc}")
+        if saved_ids:
+            with Session(engine) as s:
+                for eid in saved_ids:
+                    row = s.get(QueueEntry, eid)
+                    if row:
+                        s.delete(row)
+                s.commit()
+        send_text(tenant, customer_num,
+            "⚠️ Something went wrong while saving your booking. Please try again or contact the shop directly."
+        )
+        clear_session(tenant.id, customer_num)
+        return
+
     with Session(engine) as s:
-        total_waiting = len(s.exec(
-            select(QueueEntry).where(
-                QueueEntry.tenant_id  == tenant.id,
-                QueueEntry.queue_date == queue_date,
-                QueueEntry.status     == "Waiting"
-            )
-        ).all())
-        next_position = total_waiting + 1
-
-        parent_entry = None
-        if include_parent:
-            parent_entry = QueueEntry(
-                tenant_id          = tenant.id,
-                service_id         = service_id,
-                agent_id           = assigned_agent_id,
-                customer_number    = customer_num,
-                customer_name      = customer_name,
-                queue_date         = queue_date,
-                estimated_start    = eta,
-                position           = next_position,
-                booked_via         = "whatsapp"
-            )
-            s.add(parent_entry)
-            s.commit()
-            s.refresh(parent_entry)
-            next_position += 1
-
-        child_entries = []
-        for child_name in children_names:
-            child_entry = QueueEntry(
-                tenant_id          = tenant.id,
-                service_id         = service_id,
-                agent_id           = assigned_agent_id,
-                customer_number    = customer_num,
-                customer_name      = child_name,
-                queue_date         = queue_date,
-                estimated_start    = eta,
-                position           = next_position,
-                booked_via         = "whatsapp",
-                parent_entry_id    = parent_entry.id if parent_entry else None,
-            )
-            s.add(child_entry)
-            child_entries.append((child_name, next_position))
-            next_position += 1
-        s.commit()
-
-        agent   = s.get(Agent, assigned_agent_id)
         service = s.get(Service, service_id)
 
     clear_session(tenant.id, customer_num)
@@ -676,9 +735,19 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
     # Build position summary lines
     position_lines = ""
     if include_parent:
-        position_lines += f"\U0001f4cd *Your position:* #{parent_entry.position}\n"
-    for child_name, child_pos in child_entries:
-        position_lines += f"\U0001f476 *{child_name}:* #{child_pos}\n"
+        position_lines += (
+            f"\U0001f4cd *Your position:* #{parent_entry.position} "
+            f"| {tenant.agent_label}: {agent.name if agent else 'TBD'} "
+            f"| \u23f0 {format_eta(eta)}\n"
+        )
+    for child_name, child_pos, child_agent_id, child_eta in child_entries:
+        with Session(engine) as cs:
+            child_agent = cs.get(Agent, child_agent_id)
+        position_lines += (
+            f"\U0001f476 *{child_name}:* #{child_pos} "
+            f"| {tenant.agent_label}: {child_agent.name if child_agent else 'TBD'} "
+            f"| \u23f0 {format_eta(child_eta)}\n"
+        )
 
     # Notification promise is based on the first queued position
     first_position = parent_entry.position if include_parent else (child_entries[0][1] if child_entries else 1)
@@ -692,10 +761,8 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
     send_text(tenant, customer_num,
         f"\u2705 *You\'re in the queue!*\n\n"
         f"{position_lines}"
-        f"\U0001f464 {tenant.agent_label}: {agent.name if agent else 'TBD'}\n"
         f"\U0001f4bc {tenant.service_label}: {service.name if service else 'TBD'}\n"
-        f"\U0001f4c5 Date: {date_display}\n"
-        f"\u23f0 Estimated time: {format_eta(eta)}\n\n"
+        f"\U0001f4c5 Date: {date_display}\n\n"
         f"{notify_line}\n"
         f"Reply *status* anytime to check your position."
     )
@@ -703,13 +770,14 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
     # Notify owner (report the first booked person)
     report_name = customer_name if include_parent else (children_names[0] if children_names else customer_name)
     report_position = parent_entry.position if include_parent else (child_entries[0][1] if child_entries else 1)
+    report_eta = eta if include_parent else (child_entries[0][3] if child_entries else eta)
     if tenant.owner_number:
         send_text(tenant, normalize_number(tenant.owner_number),
             f"\U0001f514 *New Queue Entry*\n\n"
             f"\U0001f464 {report_name}\n"
             f"\U0001f4bc {service.name if service else ''}\n"
             f"\U0001f477 {agent.name if agent else ''}\n"
-            f"\U0001f4cd Position #{report_position} | \u23f0 {format_eta(eta)}"
+            f"\U0001f4cd Position #{report_position} | \u23f0 {format_eta(report_eta)}"
         )
 
 
@@ -744,7 +812,7 @@ async def handle_webhook(request: Request):
     print(f"\U0001f4e9 [{tenant.business_name}] {customer_num} | {state} | \'{text}\'")
 
     # ── GLOBAL TRIGGERS (work from any state) ─────────────────────────────
-    if any(w in text for w in ["menu","start","hi","hello","hey"]) and state not in ["awaiting_booking_for", "awaiting_children", "awaiting_children_names"]:
+    if any(w in text for w in ["menu","start","hi","hello","hey"]) and state not in ["awaiting_booking_for", "awaiting_children", "awaiting_children_names", "awaiting_arrival_time"]:
         set_session(tenant.id, customer_num, {"state": "main_menu"})
         send_main_menu(tenant, customer_num)
         return {"status": "success"}
@@ -797,7 +865,7 @@ async def handle_webhook(request: Request):
             else:
                 set_session(tenant.id, customer_num, {"state": "main_menu"})
                 send_main_menu(tenant, customer_num)
-        elif state in ("awaiting_booking_for", "awaiting_children", "awaiting_children_names"):
+        elif state in ("awaiting_booking_for", "awaiting_children", "awaiting_children_names", "awaiting_arrival_time"):
             # Nothing saved yet — just cancel and return to main menu
             clear_session(tenant.id, customer_num)
             send_text(tenant, customer_num,
@@ -842,7 +910,7 @@ async def handle_webhook(request: Request):
                             QueueEntry.tenant_id  == tenant.id,
                             QueueEntry.queue_date == existing.queue_date,
                             QueueEntry.status     == "Waiting",
-                            QueueEntry.joined_at  < existing.joined_at
+                            QueueEntry.position   < existing.position
                         )
                     ).all())
                 set_session(tenant.id, customer_num, {
@@ -1098,18 +1166,7 @@ async def handle_webhook(request: Request):
                 send_text(tenant, customer_num,
                     f"Sorry, no {tenant.agent_label.lower()}s available for that service.\n\nReply *0* to go back.")
             elif len(agents) == 1:
-                # Only one agent — skip agent menu
-                set_session(tenant.id, customer_num, {
-                    "state": "awaiting_agent",
-                    "queue_date": queue_date,
-                    "service_id": chosen_service_id,
-                    "agent_ids": [agents[0]["id"]],
-                    "service_ids": service_ids,
-                    "date_options": sess.get("date_options"),
-                    "auto_assigned": True,
-                    "auto_agent_id": agents[0]["id"],
-                })
-                # Ask who we're booking for before saving the entry
+                # Only one agent — skip agent menu, ask who we're booking for
                 set_session(tenant.id, customer_num, {
                     "state": "awaiting_booking_for",
                     "pending_agent_id": agents[0]["id"],
@@ -1200,10 +1257,19 @@ async def handle_webhook(request: Request):
         pending_queue_date = sess.get("pending_queue_date", today_str())
 
         if text == "1":
-            # Just the parent — book immediately
-            _do_assign(tenant, customer_num, customer_name,
-                       pending_agent_id, pending_service_id, pending_queue_date, sess,
-                       include_parent=True, children_names=[])
+            # Just the parent — ask arrival time before saving
+            set_session(tenant.id, customer_num, {
+                "state": "awaiting_arrival_time",
+                "pending_agent_id":   pending_agent_id,
+                "pending_service_id": pending_service_id,
+                "pending_queue_date": pending_queue_date,
+                "include_parent":     True,
+                "children_collected": [],
+            })
+            send_text(tenant, customer_num,
+                "What time do you think you'll arrive?\n\n"
+                "Reply with a time like *12:30* or reply *now* if you're already on your way."
+            )
         elif text in ("2", "3"):
             include_parent = (text == "2")
             set_session(tenant.id, customer_num, {
@@ -1276,10 +1342,41 @@ async def handle_webhook(request: Request):
                 f"Name of child {len(collected) + 1} of {count}:"
             )
         else:
-            # All names collected — save all entries now
-            _do_assign(tenant, customer_num, customer_name,
-                       pending_agent_id, pending_service_id, pending_queue_date, sess,
-                       include_parent=include_parent, children_names=collected)
+            # All names collected — ask arrival time before saving
+            set_session(tenant.id, customer_num, {
+                "state": "awaiting_arrival_time",
+                "pending_agent_id":   pending_agent_id,
+                "pending_service_id": pending_service_id,
+                "pending_queue_date": pending_queue_date,
+                "include_parent":     include_parent,
+                "children_collected": collected,
+            })
+            send_text(tenant, customer_num,
+                "What time do you think you'll arrive?\n\n"
+                "Reply with a time like *12:30* or reply *now* if you're already on your way."
+            )
+        return {"status": "success"}
+
+    # ── ARRIVAL TIME ──────────────────────────────────────────────────────
+    if state == "awaiting_arrival_time":
+        pending_agent_id   = sess.get("pending_agent_id")
+        pending_service_id = sess.get("pending_service_id")
+        pending_queue_date = sess.get("pending_queue_date", today_str())
+        include_parent     = sess.get("include_parent", True)
+        collected          = sess.get("children_collected", [])
+
+        arrival = parse_arrival_time(text, pending_queue_date)
+        if arrival is None:
+            send_text(tenant, customer_num,
+                "Sorry, I didn't understand that time. "
+                "Please reply with a time like *12:30* or *now*."
+            )
+            return {"status": "success"}
+
+        _do_assign(tenant, customer_num, customer_name,
+                   pending_agent_id, pending_service_id, pending_queue_date, sess,
+                   include_parent=include_parent, children_names=collected,
+                   earliest_arrival=arrival)
         return {"status": "success"}
 
     # ── FALLBACK ──────────────────────────────────────────────────────────
