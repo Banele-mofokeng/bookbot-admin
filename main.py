@@ -209,8 +209,10 @@ def clear_session(tenant_id: int, customer_num: str):
 def get_agent_backlog_minutes(agent_id: int, tenant_id: int, queue_date: str,
                                exclude_entry_id: Optional[int] = None) -> int:
     """
-    Total minutes of work still ahead for a given agent on a given date.
-    Counts Waiting + InService entries only (Done/NoShow/Cancelled don't block).
+    Minutes of work still ahead for a given agent on a given date.
+    - InService entries: only the REMAINING time (finish time - now), not full duration.
+    - Waiting entries: full duration.
+    This ensures ETA is based on actual remaining work, not stale totals.
     """
     with Session(engine) as s:
         entries = s.exec(
@@ -222,26 +224,36 @@ def get_agent_backlog_minutes(agent_id: int, tenant_id: int, queue_date: str,
             ).order_by(QueueEntry.joined_at)
         ).all()
 
+        current_time = now()
         total = 0
         for e in entries:
             if exclude_entry_id and e.id == exclude_entry_id:
                 continue
             svc = s.get(Service, e.service_id)
-            if svc:
+            if not svc:
+                continue
+            if e.status == "InService" and e.estimated_start:
+                # Only count the time still remaining in this service
+                finish_time = e.estimated_start + timedelta(minutes=svc.duration_minutes)
+                remaining = (finish_time - current_time).total_seconds() / 60
+                total += max(0, remaining)
+            else:
                 total += svc.duration_minutes
-    return total
+    return int(total)
 
 
 def calculate_estimated_start(tenant: Tenant, agent_id: int,
                                queue_date: str, backlog_minutes: int,
                                earliest_arrival: Optional[datetime] = None) -> datetime:
-    """Convert backlog minutes into an actual datetime."""
+    """Convert backlog minutes into an actual datetime.
+    Uses max(queue_opens, now) as the base so backlog is always added to
+    the correct anchor — preventing stale opens-time calculations mid-day.
+    """
     opens = datetime.strptime(
         f"{queue_date} {tenant.queue_opens:02d}:00", "%Y-%m-%d %H:%M"
     )
-    calculated = opens + timedelta(minutes=backlog_minutes)
-    # Never show an ETA in the past — clamp to current time
-    result = max(calculated, now())
+    base   = max(opens, now())
+    result = base + timedelta(minutes=backlog_minutes)
     # Respect customer's declared arrival time
     if earliest_arrival:
         result = max(result, earliest_arrival)
