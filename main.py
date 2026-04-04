@@ -644,7 +644,7 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
         children_names = []
 
     backlog  = get_agent_backlog_minutes(assigned_agent_id, tenant.id, queue_date)
-    eta      = calculate_estimated_start(tenant, assigned_agent_id, queue_date, backlog, earliest_arrival)
+    eta      = earliest_arrival if earliest_arrival else calculate_estimated_start(tenant, assigned_agent_id, queue_date, backlog)
 
     print(f"\U0001f4be Saving entry | tenant={tenant.id} service={service_id} agent={assigned_agent_id} date={queue_date} parent={include_parent} children={children_names}")
 
@@ -687,7 +687,7 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
                 # backlogs are accurate after each commit
                 child_agent_id = assign_agent(tenant, service_id, None, queue_date) or assigned_agent_id
                 child_backlog  = get_agent_backlog_minutes(child_agent_id, tenant.id, queue_date)
-                child_eta      = calculate_estimated_start(tenant, child_agent_id, queue_date, child_backlog, earliest_arrival)
+                child_eta      = earliest_arrival if earliest_arrival else calculate_estimated_start(tenant, child_agent_id, queue_date, child_backlog)
                 child_entry = QueueEntry(
                     tenant_id          = tenant.id,
                     service_id         = service_id,
@@ -1448,13 +1448,18 @@ class TenantCreate(SQLModel):
 def get_queue(tenant_id: int, queue_date: Optional[str] = None):
     """Get full queue for a tenant on a given date (defaults to today)."""
     target_date = queue_date or today_str()
+    # Status sort order: active entries first, terminal entries at the bottom
+    STATUS_ORDER = {"Waiting": 0, "InService": 1, "Done": 2, "NoShow": 3, "Cancelled": 4}
     with Session(engine) as s:
-        entries = s.exec(
-            select(QueueEntry).where(
-                QueueEntry.tenant_id  == tenant_id,
-                QueueEntry.queue_date == target_date
-            ).order_by(QueueEntry.position, QueueEntry.joined_at)
-        ).all()
+        entries = sorted(
+            s.exec(
+                select(QueueEntry).where(
+                    QueueEntry.tenant_id  == tenant_id,
+                    QueueEntry.queue_date == target_date
+                )
+            ).all(),
+            key=lambda e: (STATUS_ORDER.get(e.status, 9), e.position, e.joined_at)
+        )
 
         result = []
         for e in entries:
