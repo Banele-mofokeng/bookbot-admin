@@ -127,7 +127,7 @@ export default function Agents({ tenants }) {
 
       {adding && (
         <AgentForm tenantId={selectedTenantId} services={services}
-          onSave={agent => { setAgents(a => [...a, agent]); setAdding(false); show('Agent added.', 'success') }}
+          onSave={() => { load(selectedTenantId); setAdding(false); show('Agent added.', 'success') }}
           onCancel={() => setAdding(false)} />
       )}
 
@@ -138,7 +138,7 @@ export default function Agents({ tenants }) {
           {agents.map((agent, i) => (
             editing === agent.id ? (
               <AgentForm key={agent.id} tenantId={selectedTenantId} agent={agent} services={services}
-                onSave={updated => { setAgents(a => a.map(x => x.id === agent.id ? { ...x, ...updated } : x)); setEditing(null); show('Updated.', 'success') }}
+                onSave={() => { load(selectedTenantId); setEditing(null); show('Updated.', 'success') }}
                 onCancel={() => setEditing(null)} />
             ) : (
               <Card key={agent.id} className="animate-fade-up" style={{ padding: '16px 20px', animationDelay: `${i * 40}ms` }}>
