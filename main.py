@@ -834,17 +834,15 @@ async def handle_webhook(request: Request):
         if state == "awaiting_date":
             set_session(tenant.id, customer_num, {"state": "main_menu"})
             send_main_menu(tenant, customer_num)
-        elif state == "awaiting_service":
-            prev_date_options = sess.get("date_options")
-            if prev_date_options:
-                # Came from date picker — go back to it
-                set_session(tenant.id, customer_num, {
-                    "state": "awaiting_date",
-                    "date_options": prev_date_options,
-                })
-                lines_out = []
+        elif state == "awaiting_booking_for":
+            # Back from "who for" → back to date picker or main menu
+            date_options = sess.get("date_options")
+            queue_date   = sess.get("pending_queue_date", today_str())
+            if date_options:
+                set_session(tenant.id, customer_num, {"state": "awaiting_date", "date_options": date_options})
                 today_d = now().date()
-                for i, d_str in enumerate(prev_date_options):
+                lines_out = []
+                for i, d_str in enumerate(date_options):
                     d = datetime.strptime(d_str, "%Y-%m-%d").date()
                     label = d.strftime("%a %d %b")
                     if d == today_d:       label += " _(today)_"
@@ -858,26 +856,42 @@ async def handle_webhook(request: Request):
             else:
                 set_session(tenant.id, customer_num, {"state": "main_menu"})
                 send_main_menu(tenant, customer_num)
+        elif state == "awaiting_service":
+            # Back from service → back to "who for"
+            queue_date   = sess.get("pending_queue_date", today_str())
+            date_options = sess.get("date_options")
+            set_session(tenant.id, customer_num, {
+                "state":              "awaiting_booking_for",
+                "pending_queue_date": queue_date,
+                "date_options":       date_options,
+            })
+            send_text(tenant, customer_num,
+                "Who are you booking for?\n"
+                "1\ufe0f\u20e3 Just me\n"
+                "2\ufe0f\u20e3 Me and my children\n"
+                "3\ufe0f\u20e3 My children only\n\n"
+                "Reply *1*, *2*, or *3*"
+            )
         elif state == "awaiting_agent":
-            # Go back to service menu
+            # Back from agent → back to service menu
             queue_date   = sess.get("queue_date", today_str())
             service_ids  = sess.get("service_ids", [])
             if service_ids:
                 set_session(tenant.id, customer_num, {
-                    "state": "awaiting_service",
-                    "queue_date": queue_date,
-                    "service_ids": service_ids,
-                    "date_options": sess.get("date_options"),
+                    "state":              "awaiting_service",
+                    "pending_queue_date": queue_date,
+                    "service_ids":        service_ids,
+                    "date_options":       sess.get("date_options"),
+                    "include_parent":     sess.get("include_parent", True),
+                    "children_collected": sess.get("children_collected", []),
                 })
                 with Session(engine) as s:
-                    services = s.exec(
-                        select(Service).where(Service.id.in_(service_ids))
-                    ).all()
+                    services = s.exec(select(Service).where(Service.id.in_(service_ids))).all()
                 send_service_menu(tenant, customer_num, services)
             else:
                 set_session(tenant.id, customer_num, {"state": "main_menu"})
                 send_main_menu(tenant, customer_num)
-        elif state in ("awaiting_booking_for", "awaiting_children", "awaiting_children_names", "awaiting_arrival_time"):
+        elif state in ("awaiting_children", "awaiting_children_names", "awaiting_arrival_time"):
             # Nothing saved yet — just cancel and return to main menu
             clear_session(tenant.id, customer_num)
             send_text(tenant, customer_num,
@@ -952,25 +966,19 @@ async def handle_webhook(request: Request):
                 clear_session(tenant.id, customer_num)
                 return {"status": "success"}
 
-            # Start booking flow
+            # Start booking flow — ask who first, then service
             if tenant.advance_days == 0:
-                with Session(engine) as s:
-                    services = s.exec(
-                        select(Service).where(Service.tenant_id == tenant.id, Service.is_active == True)
-                    ).all()
-                    service_list = [{"id": sv.id, "name": sv.name, "duration_minutes": sv.duration_minutes} for sv in services]
-                if not service_list:
-                    send_text(tenant, customer_num, f"No services configured. Contact {tenant.business_name} directly.")
-                    clear_session(tenant.id, customer_num)
-                else:
-                    set_session(tenant.id, customer_num, {
-                        "state": "awaiting_service",
-                        "queue_date": today_str(),
-                        "service_ids": [sv["id"] for sv in service_list],
-                    })
-                    with Session(engine) as s:
-                        svc_objs = s.exec(select(Service).where(Service.id.in_([sv["id"] for sv in service_list]))).all()
-                    send_service_menu(tenant, customer_num, svc_objs)
+                set_session(tenant.id, customer_num, {
+                    "state": "awaiting_booking_for",
+                    "pending_queue_date": today_str(),
+                })
+                send_text(tenant, customer_num,
+                    "Who are you booking for?\n"
+                    "1\ufe0f\u20e3 Just me\n"
+                    "2\ufe0f\u20e3 Me and my children\n"
+                    "3\ufe0f\u20e3 My children only\n\n"
+                    "Reply *1*, *2*, or *3*"
+                )
             else:
                 send_date_menu(tenant, customer_num)
 
@@ -1076,19 +1084,19 @@ async def handle_webhook(request: Request):
                         s.add(entry)
                         s.commit()
                         recalculate_queue(tenant.id, agent_id, entry.queue_date)
-            # Start fresh booking flow
+            # Start fresh booking flow — ask who first, then service
             if tenant.advance_days == 0:
-                with Session(engine) as s:
-                    services = s.exec(select(Service).where(Service.tenant_id == tenant.id, Service.is_active == True)).all()
-                    svc_list = [{"id": sv.id, "name": sv.name} for sv in services]
                 set_session(tenant.id, customer_num, {
-                    "state": "awaiting_service",
-                    "queue_date": today_str(),
-                    "service_ids": [sv["id"] for sv in svc_list],
+                    "state": "awaiting_booking_for",
+                    "pending_queue_date": today_str(),
                 })
-                with Session(engine) as s:
-                    svc_objs = s.exec(select(Service).where(Service.id.in_([sv["id"] for sv in svc_list]))).all()
-                send_service_menu(tenant, customer_num, svc_objs)
+                send_text(tenant, customer_num,
+                    "Who are you booking for?\n"
+                    "1\ufe0f\u20e3 Just me\n"
+                    "2\ufe0f\u20e3 Me and my children\n"
+                    "3\ufe0f\u20e3 My children only\n\n"
+                    "Reply *1*, *2*, or *3*"
+                )
             else:
                 send_date_menu(tenant, customer_num)
         else:
@@ -1104,24 +1112,18 @@ async def handle_webhook(request: Request):
             return {"status": "success"}
         if text.isdigit() and 1 <= int(text) <= len(date_options):
             chosen_date = date_options[int(text) - 1]
-            with Session(engine) as s:
-                services = s.exec(
-                    select(Service).where(Service.tenant_id == tenant.id, Service.is_active == True)
-                ).all()
-                svc_list = [{"id": sv.id, "name": sv.name} for sv in services]
-            if not svc_list:
-                send_text(tenant, customer_num, f"No services configured. Contact {tenant.business_name} directly.")
-                clear_session(tenant.id, customer_num)
-            else:
-                set_session(tenant.id, customer_num, {
-                    "state": "awaiting_service",
-                    "queue_date": chosen_date,
-                    "service_ids": [sv["id"] for sv in svc_list],
-                    "date_options": date_options,
-                })
-                with Session(engine) as s:
-                    svc_objs = s.exec(select(Service).where(Service.id.in_([sv["id"] for sv in svc_list]))).all()
-                send_service_menu(tenant, customer_num, svc_objs)
+            set_session(tenant.id, customer_num, {
+                "state": "awaiting_booking_for",
+                "pending_queue_date": chosen_date,
+                "date_options": date_options,
+            })
+            send_text(tenant, customer_num,
+                "Who are you booking for?\n"
+                "1\ufe0f\u20e3 Just me\n"
+                "2\ufe0f\u20e3 Me and my children\n"
+                "3\ufe0f\u20e3 My children only\n\n"
+                "Reply *1*, *2*, or *3*"
+            )
         else:
             send_text(tenant, customer_num,
                 f"Please reply with a number between 1 and {len(date_options)}, or *0* to go back.")
@@ -1129,32 +1131,32 @@ async def handle_webhook(request: Request):
 
     # ── SERVICE SELECTION ─────────────────────────────────────────────────
     if state == "awaiting_service":
-        service_ids = sess.get("service_ids", [])
-        queue_date  = sess.get("queue_date", today_str())
+        service_ids        = sess.get("service_ids", [])
+        queue_date         = sess.get("pending_queue_date", today_str())
+        include_parent     = sess.get("include_parent", True)
+        children_collected = sess.get("children_collected", [])
+        date_options       = sess.get("date_options")
 
         if text == "0":
-            date_options = sess.get("date_options")
-            if date_options:
-                set_session(tenant.id, customer_num, {"state": "awaiting_date", "date_options": date_options})
-                today_d = now().date()
-                lines_out = []
-                for i, d_str in enumerate(date_options):
-                    d = datetime.strptime(d_str, "%Y-%m-%d").date()
-                    label = d.strftime("%a %d %b")
-                    if d == today_d:       label += " _(today)_"
-                    elif d == today_d + timedelta(days=1): label += " _(tomorrow)_"
-                    lines_out.append(f"{i+1}\u0031\ufe0f\u20e3 {label}")
-                send_text(tenant, customer_num,
-                    "*Which day?* \U0001f4c5\n\n" + "\n".join(lines_out)
-                    + "\n\nReply with a number, or *0* to go back."
-                )
-            else:
-                set_session(tenant.id, customer_num, {"state": "main_menu"})
-                send_main_menu(tenant, customer_num)
+            # Back → go to "who for" question (not date, since date is already known)
+            set_session(tenant.id, customer_num, {
+                "state":              "awaiting_booking_for",
+                "pending_queue_date": queue_date,
+                "date_options":       date_options,
+            })
+            send_text(tenant, customer_num,
+                "Who are you booking for?\n"
+                "1\ufe0f\u20e3 Just me\n"
+                "2\ufe0f\u20e3 Me and my children\n"
+                "3\ufe0f\u20e3 My children only\n\n"
+                "Reply *1*, *2*, or *3*"
+            )
             return {"status": "success"}
 
         if text.isdigit() and 1 <= int(text) <= len(service_ids):
-            chosen_service_id = service_ids[int(text) - 1]
+            chosen_service_id  = service_ids[int(text) - 1]
+            include_parent     = sess.get("include_parent", True)
+            children_collected = sess.get("children_collected", [])
             with Session(engine) as s:
                 tenant_agent_ids = [
                     a.id for a in s.exec(
@@ -1178,28 +1180,33 @@ async def handle_webhook(request: Request):
                 send_text(tenant, customer_num,
                     f"Sorry, no {tenant.agent_label.lower()}s available for that service.\n\nReply *0* to go back.")
             elif len(agents) == 1:
-                # Only one agent — skip agent menu, ask who we're booking for
+                # Only one agent — skip agent menu, go straight to arrival time
+                assigned_agent_id = agents[0]["id"]
+                _backlog = get_agent_backlog_minutes(assigned_agent_id, tenant.id, queue_date)
+                _eta     = calculate_estimated_start(tenant, assigned_agent_id, queue_date, _backlog)
                 set_session(tenant.id, customer_num, {
-                    "state": "awaiting_booking_for",
-                    "pending_agent_id": agents[0]["id"],
+                    "state":              "awaiting_arrival_time",
+                    "pending_agent_id":   assigned_agent_id,
                     "pending_service_id": chosen_service_id,
                     "pending_queue_date": queue_date,
+                    "include_parent":     include_parent,
+                    "children_collected": children_collected,
                 })
                 send_text(tenant, customer_num,
-                    "Who are you booking for?\n"
-                    "1\ufe0f\u20e3 Just me\n"
-                    "2\ufe0f\u20e3 Me and my children\n"
-                    "3\ufe0f\u20e3 My children only\n\n"
-                    "Reply *1*, *2*, or *3*"
+                    f"\u23f0 Your {tenant.agent_label.lower()} is available around *{format_eta(_eta)}*.\n\n"
+                    f"What time do you think you'll arrive?\n"
+                    f"Reply with a time like *{format_eta(_eta)}* or *now* if you're already on your way."
                 )
             else:
                 set_session(tenant.id, customer_num, {
-                    "state": "awaiting_agent",
-                    "queue_date": queue_date,
-                    "service_id": chosen_service_id,
-                    "agent_ids": [a["id"] for a in agents],
-                    "service_ids": service_ids,
-                    "date_options": sess.get("date_options"),
+                    "state":              "awaiting_agent",
+                    "queue_date":         queue_date,
+                    "service_id":         chosen_service_id,
+                    "agent_ids":          [a["id"] for a in agents],
+                    "service_ids":        service_ids,
+                    "date_options":       sess.get("date_options"),
+                    "include_parent":     include_parent,
+                    "children_collected": children_collected,
                 })
                 send_agent_menu(tenant, customer_num, agents, queue_date, chosen_service_id)
         else:
@@ -1209,19 +1216,22 @@ async def handle_webhook(request: Request):
 
     # ── AGENT SELECTION ───────────────────────────────────────────────────
     if state == "awaiting_agent":
-        agent_ids   = sess.get("agent_ids", [])
-        service_id  = sess.get("service_id")
-        queue_date  = sess.get("queue_date", today_str())
-        no_pref_idx = len(agent_ids) + 1
+        agent_ids          = sess.get("agent_ids", [])
+        service_id         = sess.get("service_id")
+        queue_date         = sess.get("queue_date", today_str())
+        include_parent     = sess.get("include_parent", True)
+        children_collected = sess.get("children_collected", [])
+        no_pref_idx        = len(agent_ids) + 1
 
         if text == "0":
-            service_ids  = sess.get("service_ids", [])
-            date_options = sess.get("date_options")
+            service_ids = sess.get("service_ids", [])
             set_session(tenant.id, customer_num, {
-                "state": "awaiting_service",
-                "queue_date": queue_date,
-                "service_ids": service_ids,
-                "date_options": date_options,
+                "state":              "awaiting_service",
+                "pending_queue_date": queue_date,
+                "service_ids":        service_ids,
+                "date_options":       date_options,
+                "include_parent":     include_parent,
+                "children_collected": children_collected,
             })
             with Session(engine) as s:
                 svc_objs = s.exec(select(Service).where(Service.id.in_(service_ids))).all()
@@ -1244,18 +1254,20 @@ async def handle_webhook(request: Request):
                     f"Sorry, no {tenant.agent_label.lower()}s available. Reply *0* to go back.")
                 return {"status": "success"}
 
+            _backlog = get_agent_backlog_minutes(assigned_agent_id, tenant.id, queue_date)
+            _eta     = calculate_estimated_start(tenant, assigned_agent_id, queue_date, _backlog)
             set_session(tenant.id, customer_num, {
-                "state": "awaiting_booking_for",
-                "pending_agent_id": assigned_agent_id,
+                "state":              "awaiting_arrival_time",
+                "pending_agent_id":   assigned_agent_id,
                 "pending_service_id": service_id,
                 "pending_queue_date": queue_date,
+                "include_parent":     include_parent,
+                "children_collected": children_collected,
             })
             send_text(tenant, customer_num,
-                "Who are you booking for?\n"
-                "1\ufe0f\u20e3 Just me\n"
-                "2\ufe0f\u20e3 Me and my children\n"
-                "3\ufe0f\u20e3 My children only\n\n"
-                "Reply *1*, *2*, or *3*"
+                f"\u23f0 Your {tenant.agent_label.lower()} is available around *{format_eta(_eta)}*.\n\n"
+                f"What time do you think you'll arrive?\n"
+                f"Reply with a time like *{format_eta(_eta)}* or *now* if you're already on your way."
             )
         else:
             send_text(tenant, customer_num,
@@ -1264,35 +1276,19 @@ async def handle_webhook(request: Request):
 
     # ── WHO ARE WE BOOKING FOR? ────────────────────────────────────────────
     if state == "awaiting_booking_for":
-        pending_agent_id   = sess.get("pending_agent_id")
-        pending_service_id = sess.get("pending_service_id")
         pending_queue_date = sess.get("pending_queue_date", today_str())
+        date_options       = sess.get("date_options")
 
         if text == "1":
-            # Just the parent — ask arrival time before saving
-            set_session(tenant.id, customer_num, {
-                "state": "awaiting_arrival_time",
-                "pending_agent_id":   pending_agent_id,
-                "pending_service_id": pending_service_id,
-                "pending_queue_date": pending_queue_date,
-                "include_parent":     True,
-                "children_collected": [],
-            })
-            _backlog = get_agent_backlog_minutes(pending_agent_id, tenant.id, pending_queue_date)
-            _eta     = calculate_estimated_start(tenant, pending_agent_id, pending_queue_date, _backlog)
-            send_text(tenant, customer_num,
-                f"\u23f0 Your {tenant.agent_label.lower()} is available around *{format_eta(_eta)}*.\n\n"
-                f"What time do you think you'll arrive?\n"
-                f"Reply with a time like *{format_eta(_eta)}* or *now* if you're already on your way."
-            )
+            include_parent = True
+            children_collected = []
         elif text in ("2", "3"):
             include_parent = (text == "2")
             set_session(tenant.id, customer_num, {
-                "state": "awaiting_children",
-                "pending_agent_id": pending_agent_id,
-                "pending_service_id": pending_service_id,
+                "state":              "awaiting_children",
                 "pending_queue_date": pending_queue_date,
-                "include_parent": include_parent,
+                "date_options":       date_options,
+                "include_parent":     include_parent,
             })
             send_text(tenant, customer_num,
                 "How many children are you booking for?\n"
@@ -1300,28 +1296,50 @@ async def handle_webhook(request: Request):
                 "2\ufe0f\u20e3 2 children\n\n"
                 "Reply *1* or *2*"
             )
+            return {"status": "success"}
         else:
             send_text(tenant, customer_num,
                 "Please reply *1* (just me), *2* (me + children), or *3* (children only)."
             )
+            return {"status": "success"}
+
+        # text == "1" path: go straight to service selection
+        with Session(engine) as s:
+            svc_objs = s.exec(
+                select(Service).where(Service.tenant_id == tenant.id, Service.is_active == True)
+            ).all()
+            svc_list = [{"id": sv.id, "name": sv.name} for sv in svc_objs]
+        if not svc_list:
+            send_text(tenant, customer_num, f"No services configured. Contact {tenant.business_name} directly.")
+            clear_session(tenant.id, customer_num)
+        else:
+            set_session(tenant.id, customer_num, {
+                "state":              "awaiting_service",
+                "pending_queue_date": pending_queue_date,
+                "date_options":       date_options,
+                "service_ids":        [sv["id"] for sv in svc_list],
+                "include_parent":     include_parent,
+                "children_collected": children_collected,
+            })
+            with Session(engine) as s:
+                svc_objs = s.exec(select(Service).where(Service.id.in_([sv["id"] for sv in svc_list]))).all()
+            send_service_menu(tenant, customer_num, svc_objs)
         return {"status": "success"}
 
     # ── HOW MANY CHILDREN? ────────────────────────────────────────────────
     if state == "awaiting_children":
-        pending_agent_id   = sess.get("pending_agent_id")
-        pending_service_id = sess.get("pending_service_id")
         pending_queue_date = sess.get("pending_queue_date", today_str())
+        date_options       = sess.get("date_options")
         include_parent     = sess.get("include_parent", True)
 
         if text.isdigit() and 1 <= int(text) <= 2:
             count = int(text)
             set_session(tenant.id, customer_num, {
-                "state": "awaiting_children_names",
-                "pending_agent_id": pending_agent_id,
-                "pending_service_id": pending_service_id,
+                "state":              "awaiting_children_names",
                 "pending_queue_date": pending_queue_date,
-                "include_parent": include_parent,
-                "children_count": count,
+                "date_options":       date_options,
+                "include_parent":     include_parent,
+                "children_count":     count,
                 "children_collected": [],
             })
             send_text(tenant, customer_num,
@@ -1335,9 +1353,8 @@ async def handle_webhook(request: Request):
 
     # ── COLLECTING CHILDREN NAMES ─────────────────────────────────────────
     if state == "awaiting_children_names":
-        pending_agent_id   = sess.get("pending_agent_id")
-        pending_service_id = sess.get("pending_service_id")
         pending_queue_date = sess.get("pending_queue_date", today_str())
+        date_options       = sess.get("date_options")
         include_parent     = sess.get("include_parent", True)
         count              = sess.get("children_count", 1)
         collected          = sess.get("children_collected", [])
@@ -1345,34 +1362,38 @@ async def handle_webhook(request: Request):
 
         if len(collected) < count:
             set_session(tenant.id, customer_num, {
-                "state": "awaiting_children_names",
-                "pending_agent_id": pending_agent_id,
-                "pending_service_id": pending_service_id,
+                "state":              "awaiting_children_names",
                 "pending_queue_date": pending_queue_date,
-                "include_parent": include_parent,
-                "children_count": count,
+                "date_options":       date_options,
+                "include_parent":     include_parent,
+                "children_count":     count,
                 "children_collected": collected,
             })
             send_text(tenant, customer_num,
                 f"Name of child {len(collected) + 1} of {count}:"
             )
         else:
-            # All names collected — ask arrival time before saving
-            set_session(tenant.id, customer_num, {
-                "state": "awaiting_arrival_time",
-                "pending_agent_id":   pending_agent_id,
-                "pending_service_id": pending_service_id,
-                "pending_queue_date": pending_queue_date,
-                "include_parent":     include_parent,
-                "children_collected": collected,
-            })
-            _backlog = get_agent_backlog_minutes(pending_agent_id, tenant.id, pending_queue_date)
-            _eta     = calculate_estimated_start(tenant, pending_agent_id, pending_queue_date, _backlog)
-            send_text(tenant, customer_num,
-                f"\u23f0 Your {tenant.agent_label.lower()} is available around *{format_eta(_eta)}*.\n\n"
-                f"What time do you think you'll arrive?\n"
-                f"Reply with a time like *{format_eta(_eta)}* or *now* if you're already on your way."
-            )
+            # All names collected — now go to service selection
+            with Session(engine) as s:
+                svc_objs = s.exec(
+                    select(Service).where(Service.tenant_id == tenant.id, Service.is_active == True)
+                ).all()
+                svc_list = [{"id": sv.id, "name": sv.name} for sv in svc_objs]
+            if not svc_list:
+                send_text(tenant, customer_num, f"No services configured. Contact {tenant.business_name} directly.")
+                clear_session(tenant.id, customer_num)
+            else:
+                set_session(tenant.id, customer_num, {
+                    "state":              "awaiting_service",
+                    "pending_queue_date": pending_queue_date,
+                    "date_options":       date_options,
+                    "service_ids":        [sv["id"] for sv in svc_list],
+                    "include_parent":     include_parent,
+                    "children_collected": collected,
+                })
+                with Session(engine) as s:
+                    svc_objs = s.exec(select(Service).where(Service.id.in_([sv["id"] for sv in svc_list]))).all()
+                send_service_menu(tenant, customer_num, svc_objs)
         return {"status": "success"}
 
     # ── ARRIVAL TIME ──────────────────────────────────────────────────────
