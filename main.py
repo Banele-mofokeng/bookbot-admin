@@ -656,7 +656,7 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
         children_names = []
 
     backlog  = get_agent_backlog_minutes(assigned_agent_id, tenant.id, queue_date)
-    eta      = earliest_arrival if earliest_arrival else calculate_estimated_start(tenant, assigned_agent_id, queue_date, backlog)
+    eta      = calculate_estimated_start(tenant, assigned_agent_id, queue_date, backlog, earliest_arrival)
 
     print(f"\U0001f4be Saving entry | tenant={tenant.id} service={service_id} agent={assigned_agent_id} date={queue_date} parent={include_parent} children={children_names}")
 
@@ -699,7 +699,7 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
                 # backlogs are accurate after each commit
                 child_agent_id = assign_agent(tenant, service_id, None, queue_date) or assigned_agent_id
                 child_backlog  = get_agent_backlog_minutes(child_agent_id, tenant.id, queue_date)
-                child_eta      = earliest_arrival if earliest_arrival else calculate_estimated_start(tenant, child_agent_id, queue_date, child_backlog)
+                child_eta      = calculate_estimated_start(tenant, child_agent_id, queue_date, child_backlog, earliest_arrival)
                 child_entry = QueueEntry(
                     tenant_id          = tenant.id,
                     service_id         = service_id,
@@ -1278,9 +1278,12 @@ async def handle_webhook(request: Request):
                 "include_parent":     True,
                 "children_collected": [],
             })
+            _backlog = get_agent_backlog_minutes(pending_agent_id, tenant.id, pending_queue_date)
+            _eta     = calculate_estimated_start(tenant, pending_agent_id, pending_queue_date, _backlog)
             send_text(tenant, customer_num,
-                "What time do you think you'll arrive?\n\n"
-                "Reply with a time like *12:30* or reply *now* if you're already on your way."
+                f"\u23f0 Your {tenant.agent_label.lower()} is available around *{format_eta(_eta)}*.\n\n"
+                f"What time do you think you'll arrive?\n"
+                f"Reply with a time like *{format_eta(_eta)}* or *now* if you're already on your way."
             )
         elif text in ("2", "3"):
             include_parent = (text == "2")
@@ -1363,9 +1366,12 @@ async def handle_webhook(request: Request):
                 "include_parent":     include_parent,
                 "children_collected": collected,
             })
+            _backlog = get_agent_backlog_minutes(pending_agent_id, tenant.id, pending_queue_date)
+            _eta     = calculate_estimated_start(tenant, pending_agent_id, pending_queue_date, _backlog)
             send_text(tenant, customer_num,
-                "What time do you think you'll arrive?\n\n"
-                "Reply with a time like *12:30* or reply *now* if you're already on your way."
+                f"\u23f0 Your {tenant.agent_label.lower()} is available around *{format_eta(_eta)}*.\n\n"
+                f"What time do you think you'll arrive?\n"
+                f"Reply with a time like *{format_eta(_eta)}* or *now* if you're already on your way."
             )
         return {"status": "success"}
 
