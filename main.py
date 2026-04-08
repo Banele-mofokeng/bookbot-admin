@@ -381,6 +381,72 @@ def recalculate_queue(tenant_id: int, agent_id: int, queue_date: str):
         s.commit()
 
 
+def find_walkin_insert_joined_at(
+    assigned_agent_id: int, tenant_id: int, tenant: "Tenant",
+    queue_date: str, walk_in_service_id: int
+) -> Optional[datetime]:
+    """
+    Check whether a walk-in can be slotted in before a future appointment.
+
+    Walks the agent's current queue in order.  At each Waiting entry that has
+    an earliest_arrival (i.e. a WhatsApp customer who said they'll arrive at
+    time T), it tests whether:
+
+        max(now, queue_opens) + accumulated_backlog + walk_in_duration  <=  T
+
+    If yes, the walk-in can finish before that customer is even due, so we
+    return a joined_at that is 1 second before that entry's joined_at.
+    recalculate_queue will then place the walk-in ahead of them.
+
+    Returns None if the walk-in should go at the end of the queue as usual.
+    """
+    with Session(engine) as s:
+        entries = s.exec(
+            select(QueueEntry).where(
+                QueueEntry.agent_id   == assigned_agent_id,
+                QueueEntry.tenant_id  == tenant_id,
+                QueueEntry.queue_date == queue_date,
+                QueueEntry.status.in_(["Waiting", "InService"])
+            ).order_by(QueueEntry.joined_at)
+        ).all()
+
+        walk_in_svc = s.get(Service, walk_in_service_id)
+        if not walk_in_svc:
+            return None
+        walk_in_duration = walk_in_svc.duration_minutes
+
+        opens = datetime.strptime(
+            f"{queue_date} {tenant.queue_opens:02d}:00", "%Y-%m-%d %H:%M"
+        )
+        base         = max(opens, now())
+        current_time = now()
+        running_minutes = 0
+
+        for entry in entries:
+            svc = s.get(Service, entry.service_id)
+            duration = svc.duration_minutes if svc else 60
+
+            if entry.status == "InService":
+                # Can't insert before someone already being served
+                if entry.estimated_start:
+                    finish = entry.estimated_start + timedelta(minutes=duration)
+                    remaining = (finish - current_time).total_seconds() / 60
+                    running_minutes += max(0, remaining)
+                else:
+                    running_minutes += duration
+                continue
+
+            # Waiting entry with a declared arrival time — can we slip in before them?
+            if entry.earliest_arrival:
+                walk_in_finish = base + timedelta(minutes=running_minutes + walk_in_duration)
+                if walk_in_finish <= entry.earliest_arrival:
+                    return entry.joined_at - timedelta(seconds=1)
+
+            running_minutes += duration
+
+    return None
+
+
 def format_duration(minutes: int) -> str:
     """Converts minutes to a human-friendly string."""
     if minutes < 60:
@@ -1580,6 +1646,11 @@ def add_walkin(body: Dict[str, Any]):
         if not assigned_agent_id:
             raise HTTPException(status_code=400, detail="No available agents for this service")
 
+        # Try to slot walk-in before a future appointment if there's a gap
+        insert_joined_at = find_walkin_insert_joined_at(
+            assigned_agent_id, tenant_id, tenant, queue_date, service_id
+        )
+
         backlog  = get_agent_backlog_minutes(assigned_agent_id, tenant_id, queue_date)
         eta      = calculate_estimated_start(tenant, assigned_agent_id, queue_date, backlog)
 
@@ -1606,19 +1677,29 @@ def add_walkin(body: Dict[str, Any]):
             position         = total_waiting + 1,
             booked_via       = "walkin"
         )
+        if insert_joined_at:
+            entry.joined_at = insert_joined_at
+
         s.add(entry)
         s.commit()
         s.refresh(entry)
 
-        agent   = s.get(Agent, assigned_agent_id)
-        service = s.get(Service, service_id)
+    # Recalculate ETAs for the whole agent queue now that the walk-in is inserted
+    recalculate_queue(tenant_id, assigned_agent_id, queue_date)
+
+    with Session(engine) as s:
+        entry     = s.get(QueueEntry, entry.id)
+        agent     = s.get(Agent, assigned_agent_id)
+        service   = s.get(Service, service_id)
+        tenant    = s.get(Tenant, tenant_id)
+        eta       = entry.estimated_start
 
         # Send WhatsApp confirmation if phone captured
         if clean_phone:
             add_line = f"\n👥 Also for: {additional_names}" if additional_names else ""
             send_text(tenant, clean_phone,
                 f"✅ *You're in the queue at {tenant.business_name}!*\n\n"
-                f"📍 Position: #{total_waiting + 1}\n"
+                f"📍 Position: #{entry.position}\n"
                 f"👤 {tenant.agent_label}: {agent.name if agent else 'TBD'}\n"
                 f"💼 {tenant.service_label}: {service.name if service else 'TBD'}\n"
                 f"⏰ Estimated time: {format_eta(eta)}"
