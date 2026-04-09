@@ -829,8 +829,10 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
 
     # Notification promise is based on the first queued position
     first_position = parent_entry.position if include_parent else (child_entries[0][1] if child_entries else 1)
-    if first_position == 1:
+    if first_position == 1 and queue_date == today_str():
         notify_line = "You\'re first in line \U0001f3c6 — head over when you\'re ready."
+    elif first_position == 1:
+        notify_line = f"You\'re first in line for {date_display} \U0001f3c6 — we\'ll notify you on the day."
     elif first_position == 2:
         notify_line = "We\'ll notify you when you\'re up next."
     else:
