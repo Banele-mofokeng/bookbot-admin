@@ -209,10 +209,12 @@ def clear_session(tenant_id: int, customer_num: str):
 def get_agent_backlog_minutes(agent_id: int, tenant_id: int, queue_date: str,
                                exclude_entry_id: Optional[int] = None) -> int:
     """
-    Minutes of work still ahead for a given agent on a given date.
-    - InService entries: only the REMAINING time (finish time - now), not full duration.
-    - Waiting entries: full duration.
-    This ensures ETA is based on actual remaining work, not stale totals.
+    Minutes from NOW until the agent finishes all current work.
+    - InService: time remaining until their service ends.
+    - Waiting with estimated_start: time until their scheduled finish
+      (estimated_start + duration), because the agent won't start them
+      before that slot — so we can't claim the agent is free any earlier.
+    - Waiting without estimated_start: full duration (fallback).
     """
     with Session(engine) as s:
         entries = s.exec(
@@ -232,11 +234,16 @@ def get_agent_backlog_minutes(agent_id: int, tenant_id: int, queue_date: str,
             svc = s.get(Service, e.service_id)
             if not svc:
                 continue
-            if e.status == "InService" and e.estimated_start:
-                # Only count the time still remaining in this service
+            if e.estimated_start:
+                # Use actual scheduled finish time so gaps (e.g. earliest_arrival)
+                # are reflected — the agent isn't free until this entry is done.
                 finish_time = e.estimated_start + timedelta(minutes=svc.duration_minutes)
                 remaining = (finish_time - current_time).total_seconds() / 60
-                total += max(0, remaining)
+                if e.status == "InService":
+                    total += max(0, remaining)
+                else:
+                    # Waiting: never less than the full service duration
+                    total += max(svc.duration_minutes, max(0, remaining))
             else:
                 total += svc.duration_minutes
     return int(total)
@@ -349,21 +356,29 @@ def recalculate_queue(tenant_id: int, agent_id: int, queue_date: str):
             ).order_by(QueueEntry.joined_at)
         ).all()
 
-        running_minutes = 0
+        current_time = now()
+        opens = datetime.strptime(
+            f"{queue_date} {tenant.queue_opens:02d}:00", "%Y-%m-%d %H:%M"
+        )
+        # next_free tracks the absolute datetime when the agent becomes free
+        next_free = max(opens, current_time)
         for entry in entries:
             svc = s.get(Service, entry.service_id)
             duration = svc.duration_minutes if svc else 60
 
             if entry.status == "InService":
-                # Frozen — don't recalculate, just add their duration to the running total
-                running_minutes += duration
+                # Frozen — advance next_free to when this service actually finishes
+                if entry.estimated_start:
+                    finish_time = entry.estimated_start + timedelta(minutes=duration)
+                    next_free = max(next_free, finish_time)
             else:
-                # Recalculate — honour the customer's declared arrival time
-                entry.estimated_start = calculate_estimated_start(
-                    tenant, agent_id, queue_date, running_minutes, entry.earliest_arrival
-                )
+                # Start no earlier than next_free, and no earlier than earliest_arrival
+                start_time = next_free
+                if entry.earliest_arrival:
+                    start_time = max(start_time, entry.earliest_arrival)
+                entry.estimated_start = start_time
                 s.add(entry)
-                running_minutes += duration
+                next_free = start_time + timedelta(minutes=duration)
 
         # Recalculate display positions across the full tenant queue for this date
         all_waiting = s.exec(
@@ -802,6 +817,13 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
         )
         clear_session(tenant.id, customer_num)
         return
+
+    # Recalculate ETAs for every agent touched by this booking
+    agents_to_recalc = {assigned_agent_id}
+    for _, _, child_agent_id, _ in child_entries:
+        agents_to_recalc.add(child_agent_id)
+    for aid in agents_to_recalc:
+        recalculate_queue(tenant.id, aid, queue_date)
 
     with Session(engine) as s:
         service = s.get(Service, service_id)
