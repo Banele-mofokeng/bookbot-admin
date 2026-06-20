@@ -15,7 +15,7 @@ const NAV = [
   },
 ]
 
-export default function Sidebar({ isOpen, onClose }) {
+export default function Sidebar({ isOpen, onClose, onLogout }) {
   return (
     <>
       {/* Dark overlay — only visible on mobile when open */}
@@ -29,20 +29,20 @@ export default function Sidebar({ isOpen, onClose }) {
         {/* Brand */}
         <div style={{ padding: '24px 24px 20px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div>
-            <div style={{ width: 32, height: 32, background: 'var(--accent)', borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 10 }}>
+            <div style={{ width: 36, height: 36, background: 'linear-gradient(135deg, #6366f1 0%, #818cf8 100%)', borderRadius: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 12, boxShadow: '0 0 18px rgba(99,102,241,0.35)' }}>
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                <path d="M2 4h12M2 8h8M2 12h5" stroke="#0b0b0e" strokeWidth="1.8" strokeLinecap="round"/>
+                <path d="M2 4h12M2 8h8M2 12h5" stroke="#fff" strokeWidth="1.8" strokeLinecap="round"/>
               </svg>
             </div>
-            <div style={{ fontSize: 14, fontWeight: 800, letterSpacing: '0.04em' }}>QUEUEBOT</div>
-            <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--muted)', marginTop: 2, letterSpacing: '0.08em' }}>ADMIN PANEL</div>
+            <div style={{ fontSize: 14, fontWeight: 800, letterSpacing: '0.06em', color: '#111827' }}>QUEUEBOT</div>
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--accent)', marginTop: 3, letterSpacing: '0.10em', fontWeight: 600 }}>ADMIN PANEL</div>
           </div>
           {/* Close button — only useful on mobile, hidden on desktop via the overlay click */}
           <button
             onClick={onClose}
             aria-label="Close menu"
             style={{
-              background: 'none', border: 'none', color: 'var(--muted)',
+              background: 'none', border: 'none', color: '#9ca3af',
               padding: 6, cursor: 'pointer', borderRadius: 6,
               display: 'flex', alignItems: 'center',
             }}
@@ -59,20 +59,30 @@ export default function Sidebar({ isOpen, onClose }) {
             <NavLink key={to} to={to} end={to === '/'} onClick={onClose}
               style={({ isActive }) => ({
                 display: 'flex', alignItems: 'center', gap: 10,
-                padding: '11px 24px', fontSize: 13, fontWeight: 600, letterSpacing: '0.03em',
-                color: isActive ? 'var(--accent)' : 'var(--muted2)',
+                padding: '11px 16px 11px 22px', fontSize: 13, fontWeight: 600, letterSpacing: '0.03em',
+                color: isActive ? 'var(--accent)' : '#6b7280',
                 textDecoration: 'none',
                 borderLeft: `2px solid ${isActive ? 'var(--accent)' : 'transparent'}`,
-                background: isActive ? 'var(--accent-dim)' : 'transparent',
+                background: isActive ? 'rgba(99,102,241,0.07)' : 'transparent',
                 transition: 'all 0.15s',
+                borderRadius: '0 8px 8px 0',
+                marginRight: 12,
               })}>
               {icon}{label}
             </NavLink>
           ))}
         </nav>
 
-        <div style={{ padding: '16px 24px', borderTop: '1px solid var(--border)' }}>
-          <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--muted)', letterSpacing: '0.06em' }}>MVP v0.2</div>
+        <div style={{ padding: '16px 24px', borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: '#9ca3af', letterSpacing: '0.06em' }}>MVP v0.2</div>
+          {onLogout && (
+            <button
+              onClick={onLogout}
+              style={{ background: 'none', border: '1px solid var(--border)', color: '#6b7280', fontSize: 11, fontWeight: 600, padding: '4px 10px', borderRadius: 6, cursor: 'pointer', letterSpacing: '0.04em' }}
+            >
+              Sign out
+            </button>
+          )}
         </div>
       </aside>
     </>

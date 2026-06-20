@@ -1,10 +1,30 @@
 const BASE = import.meta.env.VITE_API_URL || ''
 
+// Admin token — entered at the login gate and kept in localStorage so it is
+// never baked into the built bundle. Sent on every admin request.
+const TOKEN_KEY = 'admin_token'
+export const getToken   = () => localStorage.getItem(TOKEN_KEY) || ''
+export const setToken   = (t) => localStorage.setItem(TOKEN_KEY, t)
+export const clearToken = () => localStorage.removeItem(TOKEN_KEY)
+
+// Subscribers (e.g. App) get notified to drop to the login screen on 401.
+let onUnauthorized = () => {}
+export const setUnauthorizedHandler = (fn) => { onUnauthorized = fn }
+
 async function request(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-admin-token': getToken(),
+      ...(options.headers || {}),
+    },
     ...options,
   })
+  if (res.status === 401) {
+    clearToken()
+    onUnauthorized()
+    throw new Error('Unauthorized — please sign in again.')
+  }
   if (!res.ok) {
     const err = await res.text()
     throw new Error(err || `HTTP ${res.status}`)

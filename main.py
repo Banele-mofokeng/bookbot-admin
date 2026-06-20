@@ -4,7 +4,7 @@ import requests
 import redis
 from datetime import datetime, timedelta, time, date
 from zoneinfo import ZoneInfo
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Header, Depends, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import SQLModel, Field, create_engine, Session, select, Relationship
 from typing import Optional, Dict, Any, List
@@ -50,6 +50,19 @@ REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
 engine       = create_engine(DATABASE_URL)
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 SESSION_TTL  = 60 * 30  # 30 min inactivity expires session
+
+# Admin token — guards destructive maintenance endpoints. Set ADMIN_TOKEN in env.
+ADMIN_TOKEN  = os.getenv("ADMIN_TOKEN", "")
+# Allowed CORS origins — comma-separated env, defaults to "*" for local/dev.
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+
+
+def require_admin(x_admin_token: str = Header(default="")):
+    """Dependency guarding every admin endpoint (multi-tenant data is sensitive)."""
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="ADMIN_TOKEN not configured on server")
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # =============================================================================
@@ -149,11 +162,13 @@ def create_db_and_tables():
 # =============================================================================
 
 app = FastAPI(title="QueueBot — Smart Queue Platform")
+# All admin routes hang off this router so every one of them is auth-guarded.
+admin_router = APIRouter(dependencies=[Depends(require_admin)])
 scheduler = AsyncIOScheduler()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -396,24 +411,63 @@ def recalculate_queue(tenant_id: int, agent_id: int, queue_date: str):
         s.commit()
 
 
+def cancel_party(tenant_id: int, entry_id: int) -> List[int]:
+    """
+    Cancel a booking and everyone linked to it (parent + all children),
+    so a family booking never leaves stranded child entries holding agent slots.
+
+    Given any entry in the party, resolves the party root (the entry itself if
+    it's a parent, else its parent_entry_id) and cancels every active
+    (Waiting/InService) entry in that party.
+
+    Returns the list of distinct agent_ids touched, for ETA recalculation.
+    """
+    touched_agents: set = set()
+    with Session(engine) as s:
+        entry = s.get(QueueEntry, entry_id)
+        if not entry or entry.tenant_id != tenant_id:
+            return []
+        root_id = entry.parent_entry_id or entry.id
+        party = s.exec(
+            select(QueueEntry).where(
+                QueueEntry.tenant_id == tenant_id,
+                (QueueEntry.id == root_id) | (QueueEntry.parent_entry_id == root_id),
+            )
+        ).all()
+        for e in party:
+            if e.status in ("Waiting", "InService"):
+                e.status = "Cancelled"
+                s.add(e)
+                touched_agents.add(e.agent_id)
+        s.commit()
+    return list(touched_agents)
+
+
 def find_walkin_insert_joined_at(
     assigned_agent_id: int, tenant_id: int, tenant: "Tenant",
-    queue_date: str, walk_in_service_id: int
+    queue_date: str, walk_in_service_id: int,
+    new_arrival: Optional[datetime] = None,
+    exclude_entry_id: Optional[int] = None,
 ) -> Optional[datetime]:
     """
-    Check whether a walk-in can be slotted in before a future appointment.
+    Check whether a new entry can be slotted in before a future appointment.
 
     Walks the agent's current queue in order.  At each Waiting entry that has
-    an earliest_arrival (i.e. a WhatsApp customer who said they'll arrive at
-    time T), it tests whether:
+    an earliest_arrival (i.e. a customer who said they'll arrive at time T),
+    it tests whether the new entry's own start (respecting its declared
+    arrival new_arrival) plus its duration finishes before T:
 
-        max(now, queue_opens) + accumulated_backlog + walk_in_duration  <=  T
+        max(max(now, queue_opens) + accumulated_backlog, new_arrival)
+            + duration  <=  T
 
-    If yes, the walk-in can finish before that customer is even due, so we
-    return a joined_at that is 1 second before that entry's joined_at.
-    recalculate_queue will then place the walk-in ahead of them.
+    If yes, the new entry finishes before that customer is even due, so we
+    return a joined_at 1 second before that entry's joined_at.
+    recalculate_queue then places the new entry ahead of them.
 
-    Returns None if the walk-in should go at the end of the queue as usual.
+    Used by both walk-ins (new_arrival=None → can start immediately) and
+    WhatsApp joiners (new_arrival = their declared arrival time).
+
+    Returns None if the new entry should go at the end of the queue as usual.
     """
     with Session(engine) as s:
         entries = s.exec(
@@ -438,6 +492,8 @@ def find_walkin_insert_joined_at(
         running_minutes = 0
 
         for entry in entries:
+            if exclude_entry_id and entry.id == exclude_entry_id:
+                continue
             svc = s.get(Service, entry.service_id)
             duration = svc.duration_minutes if svc else 60
 
@@ -453,7 +509,11 @@ def find_walkin_insert_joined_at(
 
             # Waiting entry with a declared arrival time — can we slip in before them?
             if entry.earliest_arrival:
-                walk_in_finish = base + timedelta(minutes=running_minutes + walk_in_duration)
+                new_start = base + timedelta(minutes=running_minutes)
+                if new_arrival:
+                    # New entry can't start before its own declared arrival
+                    new_start = max(new_start, new_arrival)
+                walk_in_finish = new_start + timedelta(minutes=walk_in_duration)
                 if walk_in_finish <= entry.earliest_arrival:
                     return entry.joined_at - timedelta(seconds=1)
 
@@ -518,17 +578,52 @@ def send_service_menu(tenant: Tenant, number: str, services: list):
     )
 
 
+def get_agent_status(agent_id: int, tenant_id: int, queue_date: str):
+    """
+    Returns a display string for the agent's current availability:
+    - 'free'             — no bookings at all
+    - 'free till HH:MM'  — free now, but has an upcoming Waiting booking
+    - 'busy till HH:MM'  — currently serving someone (InService)
+    """
+    with Session(engine) as s:
+        in_service = s.exec(
+            select(QueueEntry).where(
+                QueueEntry.agent_id   == agent_id,
+                QueueEntry.tenant_id  == tenant_id,
+                QueueEntry.queue_date == queue_date,
+                QueueEntry.status     == "InService"
+            )
+        ).first()
+
+        if in_service:
+            svc         = s.get(Service, in_service.service_id)
+            duration    = svc.duration_minutes if svc else 60
+            finish_time = (in_service.estimated_start or now()) + timedelta(minutes=duration)
+            return f"_(busy till {format_eta(finish_time)})_"
+
+        next_booking = s.exec(
+            select(QueueEntry).where(
+                QueueEntry.agent_id   == agent_id,
+                QueueEntry.tenant_id  == tenant_id,
+                QueueEntry.queue_date == queue_date,
+                QueueEntry.status     == "Waiting"
+            ).order_by(QueueEntry.estimated_start)
+        ).first()
+
+        if next_booking and next_booking.estimated_start:
+            return f"_(free till {format_eta(next_booking.estimated_start)})_"
+
+        return "_(free)_"
+
+
 def send_agent_menu(tenant: Tenant, number: str,
                     agents: list, queue_date: str, service_id: int):
     lines = []
     for i, agent in enumerate(agents):
         agent_id = agent["id"] if isinstance(agent, dict) else agent.id
         name     = agent["name"] if isinstance(agent, dict) else agent.name
-        backlog  = get_agent_backlog_minutes(agent_id, tenant.id, queue_date)
-        eta      = calculate_estimated_start(tenant, agent_id, queue_date, backlog)
-        lines.append(
-            f"{i+1}️⃣ {name}  _(next free around {format_eta(eta)})_"
-        )
+        status   = get_agent_status(agent_id, tenant.id, queue_date)
+        lines.append(f"{i+1}️⃣ {name}  {status}")
     lines.append(f"{len(agents)+1}️⃣ No preference _(assign me to earliest)_")
 
     send_text(tenant, number,
@@ -634,7 +729,7 @@ async def _fire_15min_warning(tenant_id: int, agent_id: int, queue_date: str):
                 QueueEntry.tenant_id  == tenant_id,
                 QueueEntry.queue_date == queue_date,
                 QueueEntry.status     == "Waiting",
-            ).order_by(QueueEntry.joined_at)
+            ).order_by(QueueEntry.estimated_start, QueueEntry.joined_at)
         ).first()
         if not next_entry or next_entry.notified_two_away:
             return
@@ -677,7 +772,7 @@ def _fire_youre_next(tenant_id: int, agent_id: int, queue_date: str):
                 QueueEntry.tenant_id  == tenant_id,
                 QueueEntry.queue_date == queue_date,
                 QueueEntry.status     == "Waiting",
-            ).order_by(QueueEntry.joined_at)
+            ).order_by(QueueEntry.estimated_start, QueueEntry.joined_at)
         ).first()
         if not next_entry or next_entry.notified_next:
             return
@@ -710,7 +805,9 @@ async def midnight_reset_job():
         ).all()
 
         for entry in leftover:
-            entry.status = "NoShow" if entry.status == "Waiting" else "Done"
+            # Never auto-mark as Done — staff never closed it, so it doesn't
+            # count as completed work. Abandoned entries close as NoShow.
+            entry.status = "NoShow"
             s.add(entry)
 
         s.commit()
@@ -769,12 +866,24 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
                     position           = next_position,
                     booked_via         = "whatsapp"
                 )
+                # If this customer finishes before a later appointment is even
+                # due, slot them into that idle gap instead of the queue tail.
+                insert_at = find_walkin_insert_joined_at(
+                    assigned_agent_id, tenant.id, tenant, queue_date,
+                    service_id, new_arrival=earliest_arrival
+                )
+                if insert_at:
+                    parent_entry.joined_at = insert_at
                 s.add(parent_entry)
                 s.commit()
                 s.refresh(parent_entry)
                 saved_ids.append(parent_entry.id)
                 next_position += 1
 
+            # Party root for linkage. With a parent it's the parent; for a
+            # children-only booking the first child becomes the root and the
+            # rest link to it, so cancel_party can find the whole party.
+            party_root_id = parent_entry.id if parent_entry else None
             for child_name in children_names:
                 # Assign each child independently so free agents are used and
                 # backlogs are accurate after each commit
@@ -791,13 +900,22 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
                     estimated_start    = child_eta,
                     position           = next_position,
                     booked_via         = "whatsapp",
-                    parent_entry_id    = parent_entry.id if parent_entry else None,
+                    parent_entry_id    = party_root_id,
                     earliest_arrival   = earliest_arrival,
                 )
+                child_insert_at = find_walkin_insert_joined_at(
+                    child_agent_id, tenant.id, tenant, queue_date,
+                    service_id, new_arrival=earliest_arrival
+                )
+                if child_insert_at:
+                    child_entry.joined_at = child_insert_at
                 s.add(child_entry)
                 s.commit()  # commit before next child so backlog recalculates correctly
                 s.refresh(child_entry)
                 saved_ids.append(child_entry.id)
+                # First child in a parentless party becomes the root for siblings
+                if party_root_id is None:
+                    party_root_id = child_entry.id
                 child_entries.append((child_name, next_position, child_agent_id, child_eta))
                 next_position += 1
 
@@ -873,12 +991,22 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
     report_name = customer_name if include_parent else (children_names[0] if children_names else customer_name)
     report_position = parent_entry.position if include_parent else (child_entries[0][1] if child_entries else 1)
     report_eta = eta if include_parent else (child_entries[0][3] if child_entries else eta)
+    # Report the agent actually assigned to the reported person (children may
+    # land on a different agent than the parent's assigned_agent_id).
+    if include_parent:
+        report_agent_name = agent.name if agent else ""
+    elif child_entries:
+        with Session(engine) as ras:
+            ra = ras.get(Agent, child_entries[0][2])
+        report_agent_name = ra.name if ra else ""
+    else:
+        report_agent_name = agent.name if agent else ""
     if tenant.owner_number:
         send_text(tenant, normalize_number(tenant.owner_number),
             f"\U0001f514 *New Queue Entry*\n\n"
             f"\U0001f464 {report_name}\n"
             f"\U0001f4bc {service.name if service else ''}\n"
-            f"\U0001f477 {agent.name if agent else ''}\n"
+            f"\U0001f477 {report_agent_name}\n"
             f"\U0001f4cd Position #{report_position} | \u23f0 {format_eta(report_eta)}"
         )
 
@@ -893,6 +1021,13 @@ async def handle_webhook(request: Request):
     msg_data = data.get("data", {})
     if msg_data.get("key", {}).get("fromMe"):
         return {"status": "ignored"}
+
+    # Idempotency — Evolution retries deliver the same message id more than once.
+    # Without this, a retried "1"/"now" reply creates duplicate queue entries.
+    msg_id = msg_data.get("key", {}).get("id")
+    if msg_id:
+        if not redis_client.set(f"seen:{msg_id}", "1", nx=True, ex=600):
+            return {"status": "duplicate"}
 
     tenant = get_tenant_by_number(data.get("sender", ""))
     if not tenant:
@@ -1033,8 +1168,12 @@ async def handle_webhook(request: Request):
                     "state": "awaiting_rebook",
                     "existing_entry_id": existing.id,
                 })
+                existing_day = (
+                    "today" if existing.queue_date == today_str()
+                    else datetime.strptime(existing.queue_date, "%Y-%m-%d").strftime("%a %d %b")
+                )
                 send_text(tenant, customer_num,
-                    f"You\'re already in the queue today!\n\n"
+                    f"You\'re already in the queue for {existing_day}!\n\n"
                     f"\U0001f4cd Position: #{existing.position}\n"
                     f"\U0001f464 {tenant.agent_label}: {agent.name if agent else 'TBD'}\n"
                     f"\U0001f4bc {tenant.service_label}: {service.name if service else 'TBD'}\n"
@@ -1131,24 +1270,28 @@ async def handle_webhook(request: Request):
                 if not entry:
                     send_text(tenant, customer_num, "You\'re not currently in the queue.\n\nReply *menu* to go back.")
                 else:
-                    agent_id = entry.agent_id
-                    entry.status = "Cancelled"
-                    s.add(entry)
-                    s.commit()
-                    recalculate_queue(tenant.id, agent_id, today)
-                    send_text(tenant, customer_num,
-                        f"\u2705 You\'ve been removed from the queue at *{tenant.business_name}*.\n\n"
-                        f"Reply *menu* anytime to rejoin."
+                    entry_id     = entry.id
+                    party_date   = entry.queue_date
+                    cust_name    = entry.customer_name
+                    svc          = s.get(Service, entry.service_id)
+                    svc_name     = svc.name if svc else ""
+                    date_display = datetime.strptime(party_date, "%Y-%m-%d").strftime("%a %d %b")
+            # Cancel the whole party (parent + children), then recalc each agent touched
+            if entry:
+                touched = cancel_party(tenant.id, entry_id)
+                for aid in touched:
+                    recalculate_queue(tenant.id, aid, party_date)
+                send_text(tenant, customer_num,
+                    f"\u2705 You\'ve been removed from the queue at *{tenant.business_name}*.\n\n"
+                    f"Reply *menu* anytime to rejoin."
+                )
+                if tenant.owner_number:
+                    send_text(tenant, normalize_number(tenant.owner_number),
+                        f"\u274c *Queue Cancellation*\n\n"
+                        f"\U0001f464 {cust_name}\n"
+                        f"\U0001f4bc {svc_name}\n"
+                        f"\U0001f4c5 {date_display}"
                     )
-                    if tenant.owner_number:
-                        svc  = s.get(Service, entry.service_id)
-                        date_display = datetime.strptime(entry.queue_date, "%Y-%m-%d").strftime("%a %d %b")
-                        send_text(tenant, normalize_number(tenant.owner_number),
-                            f"\u274c *Queue Cancellation*\n\n"
-                            f"\U0001f464 {entry.customer_name}\n"
-                            f"\U0001f4bc {svc.name if svc else ''}\n"
-                            f"\U0001f4c5 {date_display}"
-                        )
             clear_session(tenant.id, customer_num)
 
         else:
@@ -1164,16 +1307,15 @@ async def handle_webhook(request: Request):
             clear_session(tenant.id, customer_num)
             send_text(tenant, customer_num, "\U0001f44d Got it — your spot is safe! Reply *status* to check your position.")
         elif text == "2":
-            # Cancel and rebook
+            # Cancel and rebook — cancel the whole party (parent + children)
             if existing_entry_id:
                 with Session(engine) as s:
                     entry = s.get(QueueEntry, existing_entry_id)
-                    if entry:
-                        agent_id = entry.agent_id
-                        entry.status = "Cancelled"
-                        s.add(entry)
-                        s.commit()
-                        recalculate_queue(tenant.id, agent_id, entry.queue_date)
+                    party_date = entry.queue_date if entry else None
+                if party_date:
+                    touched = cancel_party(tenant.id, existing_entry_id)
+                    for aid in touched:
+                        recalculate_queue(tenant.id, aid, party_date)
             # Start fresh booking flow — ask who first, then service
             if tenant.advance_days == 0:
                 set_session(tenant.id, customer_num, {
@@ -1514,44 +1656,6 @@ async def handle_webhook(request: Request):
     return {"status": "success"}
 
 
-import os
-import json
-import requests
-import redis
-from datetime import datetime, timedelta, time, date
-from zoneinfo import ZoneInfo
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import SQLModel, Field, create_engine, Session, select, Relationship
-from typing import Optional, Dict, Any, List
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-# Timezone — set TZ env var to your local timezone e.g. "Africa/Johannesburg"
-TZ = ZoneInfo(os.getenv("TZ", "Africa/Johannesburg"))
-
-def now() -> datetime:
-    """Current local time aware of the configured timezone."""
-    return datetime.now(TZ).replace(tzinfo=None)
-
-def today_str() -> str:
-    """Today's date as ISO string in local timezone."""
-    return now().date().isoformat()
-
-def yesterday_str() -> str:
-    return (now().date() - timedelta(days=1)).isoformat()
-
-def normalize_number(number: str) -> str:
-    """
-    Ensures a SA number has the correct country code.
-    0812345678   → 27812345678
-    27812345678  → 27812345678
-    +27812345678 → 27812345678
-    """
-    n = number.strip().replace("+", "").replace(" ", "")
-    if n.startswith("0"):
-        n = "27" + n[1:]
-    return n
-
 class TenantCreate(SQLModel):
     """Separate create schema so id is never accepted from the client."""
     business_name:      str
@@ -1573,7 +1677,7 @@ class TenantCreate(SQLModel):
 # 10. ADMIN — QUEUE MANAGEMENT
 # =============================================================================
 
-@app.get("/admin/queue/{tenant_id}")
+@admin_router.get("/admin/queue/{tenant_id}")
 def get_queue(tenant_id: int, queue_date: Optional[str] = None):
     """Get full queue for a tenant on a given date (defaults to today)."""
     target_date = queue_date or today_str()
@@ -1611,7 +1715,7 @@ def get_queue(tenant_id: int, queue_date: Optional[str] = None):
         return result
 
 
-@app.patch("/admin/queue/{entry_id}/status")
+@admin_router.patch("/admin/queue/{entry_id}/status")
 def update_entry_status(entry_id: int, body: Dict[str, Any]):
     """Update a queue entry status and recalculate ETAs."""
     new_status = body.get("status")
@@ -1643,7 +1747,7 @@ def update_entry_status(entry_id: int, body: Dict[str, Any]):
     return {"status": "updated", "entry_id": entry_id, "new_status": new_status}
 
 
-@app.post("/admin/queue/walkin")
+@admin_router.post("/admin/queue/walkin")
 def add_walkin(body: Dict[str, Any]):
     """Add a walk-in customer from the admin dashboard."""
     tenant_id        = body.get("tenant_id")
@@ -1692,7 +1796,9 @@ def add_walkin(body: Dict[str, Any]):
             tenant_id        = tenant_id,
             service_id       = service_id,
             agent_id         = assigned_agent_id,
-            customer_number  = "walkin",
+            # Store captured phone so walk-ins are findable later; fall back to
+            # literal "walkin" when no number was given.
+            customer_number  = clean_phone or "walkin",
             customer_name    = name,
             customer_phone   = clean_phone,
             additional_names = additional_names,
@@ -1746,12 +1852,12 @@ def add_walkin(body: Dict[str, Any]):
 # 11. ADMIN — TENANTS
 # =============================================================================
 
-@app.get("/admin/tenants")
+@admin_router.get("/admin/tenants")
 def list_tenants():
     with Session(engine) as s:
         return s.exec(select(Tenant)).all()
 
-@app.post("/admin/tenants")
+@admin_router.post("/admin/tenants")
 def create_tenant(data: TenantCreate):
     tenant = Tenant(**data.dict())
     with Session(engine) as s:
@@ -1761,7 +1867,7 @@ def create_tenant(data: TenantCreate):
     return tenant
 
 
-@app.patch("/admin/tenants/{tenant_id}")
+@admin_router.patch("/admin/tenants/{tenant_id}")
 def update_tenant(tenant_id: int, updates: Dict[str, Any]):
     with Session(engine) as s:
         tenant = s.get(Tenant, tenant_id)
@@ -1780,7 +1886,7 @@ def update_tenant(tenant_id: int, updates: Dict[str, Any]):
 # 12. ADMIN — SERVICES
 # =============================================================================
 
-@app.get("/admin/services/{tenant_id}")
+@admin_router.get("/admin/services/{tenant_id}")
 def list_services(tenant_id: int):
     with Session(engine) as s:
         return s.exec(
@@ -1795,7 +1901,7 @@ class ServiceCreate(SQLModel):
     is_active:         bool = True
 
 
-@app.post("/admin/services")
+@admin_router.post("/admin/services")
 def create_service(data: ServiceCreate):
     service = Service(**data.dict())
     with Session(engine) as s:
@@ -1805,7 +1911,7 @@ def create_service(data: ServiceCreate):
     return service
 
 
-@app.patch("/admin/services/{service_id}")
+@admin_router.patch("/admin/services/{service_id}")
 def update_service(service_id: int, updates: Dict[str, Any]):
     with Session(engine) as s:
         svc = s.get(Service, service_id)
@@ -1824,7 +1930,7 @@ def update_service(service_id: int, updates: Dict[str, Any]):
 # 13. ADMIN — AGENTS
 # =============================================================================
 
-@app.get("/admin/agents/{tenant_id}")
+@admin_router.get("/admin/agents/{tenant_id}")
 def list_agents(tenant_id: int):
     with Session(engine) as s:
         agents = s.exec(
@@ -1841,7 +1947,7 @@ def list_agents(tenant_id: int):
         return result
 
 
-@app.post("/admin/agents")
+@admin_router.post("/admin/agents")
 def create_agent(body: Dict[str, Any]):
     """Create an agent and assign their services in one call."""
     service_ids = body.pop("service_ids", [])
@@ -1857,7 +1963,7 @@ def create_agent(body: Dict[str, Any]):
     return {**agent.dict(), "service_ids": service_ids}
 
 
-@app.patch("/admin/agents/{agent_id}")
+@admin_router.patch("/admin/agents/{agent_id}")
 def update_agent(agent_id: int, updates: Dict[str, Any]):
     service_ids = updates.pop("service_ids", None)
     with Session(engine) as s:
@@ -1903,9 +2009,10 @@ def health():
     return {"status": "ok", "redis": redis_ok, "tenants": tenants}
 
 
-@app.post("/admin/migrate-reset")
+@admin_router.post("/admin/migrate-reset")
 def migrate_reset():
-    """Drop and recreate all tables using CASCADE to handle FK dependencies."""
+    """Drop and recreate all tables using CASCADE to handle FK dependencies.
+    Destructive — requires x-admin-token header matching ADMIN_TOKEN env."""
     from sqlalchemy import text
     with engine.connect() as conn:
         conn.execute(text(
@@ -1914,6 +2021,10 @@ def migrate_reset():
         conn.commit()
     SQLModel.metadata.create_all(engine)
     return {"status": "done"}
+
+
+# Register all guarded admin routes (must run after every @admin_router route above)
+app.include_router(admin_router)
 
 
 if __name__ == "__main__":
