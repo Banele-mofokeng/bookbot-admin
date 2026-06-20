@@ -24,11 +24,15 @@
    ```
    DATABASE_URL=postgres://postgres:<password>@<project>_booking-db:5432/whatsapp_bot
    REDIS_URL=redis://default:<password>@<project>_evolution-api-redis:6379
-   ADMIN_TOKEN=<long-random-secret>          # REQUIRED — guards every /admin/* route
+   JWT_SECRET=<long-random-secret>           # REQUIRED — signs login tokens
+   SUPERADMIN_EMAIL=you@example.com          # your platform-operator login (seeded on boot)
+   SUPERADMIN_PASSWORD=<strong-password>     # change after first login
    ALLOWED_ORIGINS=https://your-admin-url.easypanel.host   # CORS allow-list (defaults to *)
    TZ=Africa/Johannesburg
    ```
-   - `ADMIN_TOKEN` **must be set** or all admin endpoints return `503`. Generate one e.g. `openssl rand -hex 32`.
+   - `JWT_SECRET` **must be set** or auth returns `503`. Generate one e.g. `openssl rand -hex 32`.
+   - `SUPERADMIN_EMAIL`/`SUPERADMIN_PASSWORD` seed your super-admin account on startup
+     (only if it doesn't already exist). Without them, no one can log in.
    - `ALLOWED_ORIGINS` is comma-separated; set it to your admin URL in production instead of `*`.
 5. Deploy
 
@@ -59,18 +63,29 @@
 
 ---
 
-## Admin authentication
+## Authentication & multi-tenant access
 
-Every `/admin/*` route now requires an `x-admin-token` header matching the
-server's `ADMIN_TOKEN`. The React dashboard shows a **login screen** on first
-load: paste the same `ADMIN_TOKEN` value. It is stored in the browser's
-`localStorage` (never baked into the build) and sent on every request. Use
-**Sign out** in the sidebar to clear it.
+Email + password logins, scoped per business:
 
-Defense in depth: still deploy the admin UI on a private/separate domain. The
-token is a shared secret — anyone who has it has full admin access.
+- **Super-admin (you):** seeded from `SUPERADMIN_EMAIL`/`SUPERADMIN_PASSWORD`.
+  Sees every business, creates businesses, and provisions client logins.
+- **Tenant user (each client):** only sees and manages their **own** business —
+  queue, services, agents. Cannot see other tenants or the Businesses page.
 
-`/health` stays public for uptime checks. `/webhook` stays public for Evolution.
+Login flow: dashboard shows an email/password screen → `POST /auth/login`
+returns a JWT, stored in `localStorage` (never baked into the build) and sent as
+`Authorization: Bearer …` on every request. **Sign out** clears it. Tokens
+expire after `JWT_EXP_HOURS` (default 12).
+
+### Onboarding a client (model B)
+1. **Businesses → + Add Business** — register the tenant + its Evolution config.
+2. On that business row, **Add login** — set the client's email + password
+   (8+ chars). Send them the credentials.
+3. They log in and see only their own queue. Reset/deactivate via the API
+   (`PATCH /admin/users/{id}`).
+
+Every `/admin/*` route is authenticated and tenant-scoped server-side, so the
+isolation holds even if the UI is bypassed. `/health` and `/webhook` stay public.
 
 ---
 

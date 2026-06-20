@@ -1,7 +1,11 @@
 import os
 import json
+import hashlib
+import hmac
+import secrets
 import requests
 import redis
+import jwt
 from datetime import datetime, timedelta, time, date
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, HTTPException, Header, Depends, APIRouter
@@ -51,18 +55,17 @@ engine       = create_engine(DATABASE_URL)
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 SESSION_TTL  = 60 * 30  # 30 min inactivity expires session
 
-# Admin token — guards destructive maintenance endpoints. Set ADMIN_TOKEN in env.
-ADMIN_TOKEN  = os.getenv("ADMIN_TOKEN", "")
 # Allowed CORS origins — comma-separated env, defaults to "*" for local/dev.
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 
-
-def require_admin(x_admin_token: str = Header(default="")):
-    """Dependency guarding every admin endpoint (multi-tenant data is sensitive)."""
-    if not ADMIN_TOKEN:
-        raise HTTPException(status_code=503, detail="ADMIN_TOKEN not configured on server")
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+# ── Auth config ──────────────────────────────────────────────────────────────
+# JWT signing secret — REQUIRED in production. Tokens are unverifiable without it.
+JWT_SECRET     = os.getenv("JWT_SECRET", "")
+JWT_ALG        = "HS256"
+JWT_EXP_HOURS  = int(os.getenv("JWT_EXP_HOURS", "12"))
+# Super-admin (platform operator) seeded on startup if absent.
+SUPERADMIN_EMAIL    = os.getenv("SUPERADMIN_EMAIL", "")
+SUPERADMIN_PASSWORD = os.getenv("SUPERADMIN_PASSWORD", "")
 
 
 # =============================================================================
@@ -86,6 +89,18 @@ class Tenant(SQLModel, table=True):
     queue_opens: int           = 8                   # 8 = 08:00
     queue_closes: int          = 17                  # 17 = 17:00
     advance_days: int          = 1                   # how many days ahead allowed (0 = today only)
+    is_active: bool            = True
+
+
+class User(SQLModel, table=True):
+    """A dashboard login. Either a super-admin (platform operator, tenant_id=None)
+    or a tenant user who can only see/manage their own business."""
+    __tablename__ = "app_user"  # avoid the reserved word "user" in Postgres
+    id: Optional[int]          = Field(default=None, primary_key=True)
+    email: str                 = Field(index=True)       # unique login email (stored lowercased)
+    password_hash: str                                   # pbkdf2 "iterations$salt$hash"
+    tenant_id: Optional[int]   = Field(default=None, foreign_key="tenant.id")  # None = super-admin
+    is_super: bool             = False
     is_active: bool            = True
 
 
@@ -158,12 +173,93 @@ def create_db_and_tables():
 
 
 # =============================================================================
+# 2b. AUTH — PASSWORDS, JWT, DEPENDENCIES
+# =============================================================================
+
+def hash_password(password: str) -> str:
+    """PBKDF2-SHA256 (stdlib, no native deps). Format: 'iterations$salt_hex$hash_hex'."""
+    iterations = 200_000
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return f"{iterations}${salt.hex()}${dk.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        iter_s, salt_hex, hash_hex = stored.split("$")
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), int(iter_s))
+        return hmac.compare_digest(dk.hex(), hash_hex)
+    except Exception:
+        return False
+
+
+def create_access_token(user: "User") -> str:
+    payload = {
+        "sub": str(user.id),
+        "email": user.email,
+        "is_super": user.is_super,
+        "tenant_id": user.tenant_id,
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXP_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+
+def get_current_user(authorization: str = Header(default="")) -> "User":
+    """Validate the Bearer JWT and return the live User row."""
+    if not JWT_SECRET:
+        raise HTTPException(status_code=503, detail="JWT_SECRET not configured on server")
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    with Session(engine) as s:
+        user = s.get(User, int(payload.get("sub", 0)))
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+    return user
+
+
+def require_super(user: "User" = Depends(get_current_user)) -> "User":
+    if not user.is_super:
+        raise HTTPException(status_code=403, detail="Super-admin only")
+    return user
+
+
+def ensure_tenant_access(user: "User", tenant_id: int):
+    """Super-admins reach any tenant; tenant users only their own."""
+    if user.is_super:
+        return
+    if user.tenant_id != tenant_id:
+        raise HTTPException(status_code=403, detail="Forbidden — not your business")
+
+
+def seed_superadmin():
+    """Create the platform operator login from env if it doesn't exist yet."""
+    if not (SUPERADMIN_EMAIL and SUPERADMIN_PASSWORD):
+        print("⚠️  SUPERADMIN_EMAIL/PASSWORD not set — no super-admin seeded.")
+        return
+    email = SUPERADMIN_EMAIL.strip().lower()
+    with Session(engine) as s:
+        existing = s.exec(select(User).where(User.email == email)).first()
+        if existing:
+            return
+        s.add(User(email=email, password_hash=hash_password(SUPERADMIN_PASSWORD),
+                   tenant_id=None, is_super=True, is_active=True))
+        s.commit()
+    print(f"✅ Seeded super-admin {email}")
+
+
+# =============================================================================
 # 3. APP + SCHEDULER
 # =============================================================================
 
 app = FastAPI(title="QueueBot — Smart Queue Platform")
-# All admin routes hang off this router so every one of them is auth-guarded.
-admin_router = APIRouter(dependencies=[Depends(require_admin)])
+# Every admin route hangs off this router; the dependency authenticates the
+# caller. Per-route handlers additionally scope data to the caller's tenant.
+admin_router = APIRouter(dependencies=[Depends(get_current_user)])
 scheduler = AsyncIOScheduler()
 
 app.add_middleware(
@@ -178,6 +274,7 @@ app.add_middleware(
 async def on_startup():
     print("🚀 QueueBot starting...")
     create_db_and_tables()
+    seed_superadmin()
     scheduler.add_job(midnight_reset_job, "cron", hour=0, minute=1, id="midnight_reset")
     scheduler.start()
     print("✅ DB ready. Scheduler running.")
@@ -1674,12 +1771,104 @@ class TenantCreate(SQLModel):
 
 
 # =============================================================================
+# 9b. AUTH ROUTES
+# =============================================================================
+
+class LoginBody(SQLModel):
+    email: str
+    password: str
+
+
+def _user_public(user: User, tenant: Optional[Tenant]) -> dict:
+    return {
+        "id":        user.id,
+        "email":     user.email,
+        "is_super":  user.is_super,
+        "tenant_id": user.tenant_id,
+        "tenant":    tenant.dict() if tenant else None,
+    }
+
+
+@app.post("/auth/login")
+def login(body: LoginBody):
+    email = (body.email or "").strip().lower()
+    with Session(engine) as s:
+        user = s.exec(select(User).where(User.email == email)).first()
+        if not user or not user.is_active or not verify_password(body.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        tenant = s.get(Tenant, user.tenant_id) if user.tenant_id else None
+        token = create_access_token(user)
+        return {"access_token": token, "token_type": "bearer", "user": _user_public(user, tenant)}
+
+
+@app.get("/auth/me")
+def whoami(user: User = Depends(get_current_user)):
+    with Session(engine) as s:
+        tenant = s.get(Tenant, user.tenant_id) if user.tenant_id else None
+    return _user_public(user, tenant)
+
+
+class UserCreate(SQLModel):
+    email:     str
+    password:  str
+    tenant_id: Optional[int] = None
+    is_super:  bool = False
+
+
+@admin_router.get("/admin/users")
+def list_users(user: User = Depends(require_super)):
+    with Session(engine) as s:
+        rows = s.exec(select(User)).all()
+        return [{"id": u.id, "email": u.email, "is_super": u.is_super,
+                 "tenant_id": u.tenant_id, "is_active": u.is_active} for u in rows]
+
+
+@admin_router.post("/admin/users")
+def create_user(data: UserCreate, _: User = Depends(require_super)):
+    """Provision a login. Super-admin only (no public signup)."""
+    email = data.email.strip().lower()
+    if not data.password or len(data.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    with Session(engine) as s:
+        if s.exec(select(User).where(User.email == email)).first():
+            raise HTTPException(status_code=409, detail="Email already registered")
+        if not data.is_super:
+            if not data.tenant_id or not s.get(Tenant, data.tenant_id):
+                raise HTTPException(status_code=400, detail="Valid tenant_id required for a tenant user")
+        u = User(email=email, password_hash=hash_password(data.password),
+                 tenant_id=None if data.is_super else data.tenant_id,
+                 is_super=data.is_super, is_active=True)
+        s.add(u); s.commit(); s.refresh(u)
+        return {"id": u.id, "email": u.email, "is_super": u.is_super, "tenant_id": u.tenant_id}
+
+
+@admin_router.patch("/admin/users/{user_id}")
+def update_user(user_id: int, updates: Dict[str, Any], _: User = Depends(require_super)):
+    """Reset password / deactivate. Super-admin only."""
+    with Session(engine) as s:
+        u = s.get(User, user_id)
+        if not u:
+            raise HTTPException(status_code=404, detail="User not found")
+        if "password" in updates:
+            pw = updates["password"]
+            if not pw or len(pw) < 8:
+                raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+            u.password_hash = hash_password(pw)
+        if "is_active" in updates:
+            u.is_active = bool(updates["is_active"])
+        s.add(u); s.commit()
+        return {"id": u.id, "email": u.email, "is_active": u.is_active}
+
+
+# =============================================================================
 # 10. ADMIN — QUEUE MANAGEMENT
 # =============================================================================
 
 @admin_router.get("/admin/queue/{tenant_id}")
-def get_queue(tenant_id: int, queue_date: Optional[str] = None):
+def get_queue(tenant_id: int, queue_date: Optional[str] = None,
+              user: User = Depends(get_current_user)):
     """Get full queue for a tenant on a given date (defaults to today)."""
+    ensure_tenant_access(user, tenant_id)
     target_date = queue_date or today_str()
     # Status sort order: active entries first, terminal entries at the bottom
     STATUS_ORDER = {"Waiting": 0, "InService": 1, "Done": 2, "NoShow": 3, "Cancelled": 4}
@@ -1716,7 +1905,8 @@ def get_queue(tenant_id: int, queue_date: Optional[str] = None):
 
 
 @admin_router.patch("/admin/queue/{entry_id}/status")
-def update_entry_status(entry_id: int, body: Dict[str, Any]):
+def update_entry_status(entry_id: int, body: Dict[str, Any],
+                        user: User = Depends(get_current_user)):
     """Update a queue entry status and recalculate ETAs."""
     new_status = body.get("status")
     if new_status not in ["InService", "Done", "NoShow", "Cancelled"]:
@@ -1726,6 +1916,7 @@ def update_entry_status(entry_id: int, body: Dict[str, Any]):
         entry = s.get(QueueEntry, entry_id)
         if not entry:
             raise HTTPException(status_code=404, detail="Entry not found")
+        ensure_tenant_access(user, entry.tenant_id)
         agent_id   = entry.agent_id
         tenant_id  = entry.tenant_id
         queue_date = entry.queue_date
@@ -1748,9 +1939,10 @@ def update_entry_status(entry_id: int, body: Dict[str, Any]):
 
 
 @admin_router.post("/admin/queue/walkin")
-def add_walkin(body: Dict[str, Any]):
+def add_walkin(body: Dict[str, Any], user: User = Depends(get_current_user)):
     """Add a walk-in customer from the admin dashboard."""
     tenant_id        = body.get("tenant_id")
+    ensure_tenant_access(user, tenant_id)
     service_id       = body.get("service_id")
     agent_id         = body.get("agent_id")
     name             = body.get("customer_name", "Walk-in")
@@ -1853,12 +2045,16 @@ def add_walkin(body: Dict[str, Any]):
 # =============================================================================
 
 @admin_router.get("/admin/tenants")
-def list_tenants():
+def list_tenants(user: User = Depends(get_current_user)):
     with Session(engine) as s:
-        return s.exec(select(Tenant)).all()
+        if user.is_super:
+            return s.exec(select(Tenant)).all()
+        # Tenant users only ever see their own business
+        t = s.get(Tenant, user.tenant_id) if user.tenant_id else None
+        return [t] if t else []
 
 @admin_router.post("/admin/tenants")
-def create_tenant(data: TenantCreate):
+def create_tenant(data: TenantCreate, _: User = Depends(require_super)):
     tenant = Tenant(**data.dict())
     with Session(engine) as s:
         s.add(tenant)
@@ -1868,7 +2064,9 @@ def create_tenant(data: TenantCreate):
 
 
 @admin_router.patch("/admin/tenants/{tenant_id}")
-def update_tenant(tenant_id: int, updates: Dict[str, Any]):
+def update_tenant(tenant_id: int, updates: Dict[str, Any],
+                  user: User = Depends(get_current_user)):
+    ensure_tenant_access(user, tenant_id)
     with Session(engine) as s:
         tenant = s.get(Tenant, tenant_id)
         if not tenant:
@@ -1887,7 +2085,8 @@ def update_tenant(tenant_id: int, updates: Dict[str, Any]):
 # =============================================================================
 
 @admin_router.get("/admin/services/{tenant_id}")
-def list_services(tenant_id: int):
+def list_services(tenant_id: int, user: User = Depends(get_current_user)):
+    ensure_tenant_access(user, tenant_id)
     with Session(engine) as s:
         return s.exec(
             select(Service).where(Service.tenant_id == tenant_id)
@@ -1902,7 +2101,8 @@ class ServiceCreate(SQLModel):
 
 
 @admin_router.post("/admin/services")
-def create_service(data: ServiceCreate):
+def create_service(data: ServiceCreate, user: User = Depends(get_current_user)):
+    ensure_tenant_access(user, data.tenant_id)
     service = Service(**data.dict())
     with Session(engine) as s:
         s.add(service)
@@ -1912,11 +2112,13 @@ def create_service(data: ServiceCreate):
 
 
 @admin_router.patch("/admin/services/{service_id}")
-def update_service(service_id: int, updates: Dict[str, Any]):
+def update_service(service_id: int, updates: Dict[str, Any],
+                   user: User = Depends(get_current_user)):
     with Session(engine) as s:
         svc = s.get(Service, service_id)
         if not svc:
             raise HTTPException(status_code=404, detail="Service not found")
+        ensure_tenant_access(user, svc.tenant_id)
         for k, v in updates.items():
             if hasattr(svc, k):
                 setattr(svc, k, v)
@@ -1931,7 +2133,8 @@ def update_service(service_id: int, updates: Dict[str, Any]):
 # =============================================================================
 
 @admin_router.get("/admin/agents/{tenant_id}")
-def list_agents(tenant_id: int):
+def list_agents(tenant_id: int, user: User = Depends(get_current_user)):
+    ensure_tenant_access(user, tenant_id)
     with Session(engine) as s:
         agents = s.exec(
             select(Agent).where(Agent.tenant_id == tenant_id)
@@ -1948,8 +2151,9 @@ def list_agents(tenant_id: int):
 
 
 @admin_router.post("/admin/agents")
-def create_agent(body: Dict[str, Any]):
+def create_agent(body: Dict[str, Any], user: User = Depends(get_current_user)):
     """Create an agent and assign their services in one call."""
+    ensure_tenant_access(user, body.get("tenant_id"))
     service_ids = body.pop("service_ids", [])
     body.pop("id", None)  # never accept id from client
     with Session(engine) as s:
@@ -1964,12 +2168,14 @@ def create_agent(body: Dict[str, Any]):
 
 
 @admin_router.patch("/admin/agents/{agent_id}")
-def update_agent(agent_id: int, updates: Dict[str, Any]):
+def update_agent(agent_id: int, updates: Dict[str, Any],
+                 user: User = Depends(get_current_user)):
     service_ids = updates.pop("service_ids", None)
     with Session(engine) as s:
         agent = s.get(Agent, agent_id)
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
+        ensure_tenant_access(user, agent.tenant_id)
         for k, v in updates.items():
             if hasattr(agent, k):
                 setattr(agent, k, v)
@@ -2010,9 +2216,8 @@ def health():
 
 
 @admin_router.post("/admin/migrate-reset")
-def migrate_reset():
-    """Drop and recreate all tables using CASCADE to handle FK dependencies.
-    Destructive — requires x-admin-token header matching ADMIN_TOKEN env."""
+def migrate_reset(_: User = Depends(require_super)):
+    """Drop and recreate all tables using CASCADE. Destructive — super-admin only."""
     from sqlalchemy import text
     with engine.connect() as conn:
         conn.execute(text(

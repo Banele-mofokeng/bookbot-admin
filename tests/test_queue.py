@@ -92,12 +92,12 @@ def test_cancel_party_wrong_tenant_noop():
     assert row.status == "Waiting"
 
 
-# ── admin auth (the open-API fix) ────────────────────────────────
-def test_admin_requires_token():
+# ── admin auth (JWT) ─────────────────────────────────────────────
+def test_admin_requires_bearer_token(super_token):
     client = TestClient(main.app)
     assert client.get("/admin/tenants").status_code == 401
-    assert client.get("/admin/tenants", headers={"x-admin-token": "wrong"}).status_code == 401
-    ok = client.get("/admin/tenants", headers={"x-admin-token": "test-token"})
+    assert client.get("/admin/tenants", headers={"Authorization": "Bearer bad"}).status_code == 401
+    ok = client.get("/admin/tenants", headers={"Authorization": f"Bearer {super_token}"})
     assert ok.status_code == 200
 
 
@@ -105,3 +105,68 @@ def test_health_is_public():
     client = TestClient(main.app)
     # health hits redis; if redis is down it still returns 200 with an error string
     assert client.get("/health").status_code == 200
+
+
+# ── per-tenant isolation (model B) ───────────────────────────────
+def _login(client, email, password):
+    r = client.post("/auth/login", json={"email": email, "password": password})
+    assert r.status_code == 200, r.text
+    return r.json()["access_token"]
+
+
+def test_tenant_user_sees_only_own_business(super_token):
+    client = TestClient(main.app)
+    sh = {"Authorization": f"Bearer {super_token}"}
+
+    # Super creates two tenants
+    def mk_tenant(name, number):
+        r = client.post("/admin/tenants", headers=sh, json={
+            "business_name": name, "whatsapp_number": number,
+            "evolution_instance": "i", "evolution_api_key": "k", "evolution_api_url": "http://x",
+        })
+        assert r.status_code == 200, r.text
+        return r.json()["id"]
+
+    t1 = mk_tenant("Salon A", "27810000001")
+    t2 = mk_tenant("Clinic B", "27810000002")
+
+    # Super creates a login for tenant 1
+    r = client.post("/admin/users", headers=sh, json={
+        "email": "owner1@test.com", "password": "ownerpass1", "tenant_id": t1,
+    })
+    assert r.status_code == 200, r.text
+
+    tok1 = _login(client, "owner1@test.com", "ownerpass1")
+    h1 = {"Authorization": f"Bearer {tok1}"}
+
+    # Tenant 1 sees only its own business
+    listed = client.get("/admin/tenants", headers=h1).json()
+    assert [t["id"] for t in listed] == [t1]
+
+    # Tenant 1 cannot read tenant 2's queue/services/agents
+    assert client.get(f"/admin/queue/{t2}", headers=h1).status_code == 403
+    assert client.get(f"/admin/services/{t2}", headers=h1).status_code == 403
+    assert client.get(f"/admin/agents/{t2}", headers=h1).status_code == 403
+
+    # ...but can read its own
+    assert client.get(f"/admin/queue/{t1}", headers=h1).status_code == 200
+
+
+def test_tenant_user_cannot_create_tenant_or_reset(super_token):
+    client = TestClient(main.app)
+    sh = {"Authorization": f"Bearer {super_token}"}
+    r = client.post("/admin/tenants", headers=sh, json={
+        "business_name": "Solo", "whatsapp_number": "27810000003",
+        "evolution_instance": "i", "evolution_api_key": "k", "evolution_api_url": "http://x",
+    })
+    tid = r.json()["id"]
+    client.post("/admin/users", headers=sh, json={
+        "email": "o@test.com", "password": "ownerpass1", "tenant_id": tid})
+    tok = _login(client, "o@test.com", "ownerpass1")
+    h = {"Authorization": f"Bearer {tok}"}
+
+    assert client.post("/admin/tenants", headers=h, json={
+        "business_name": "X", "whatsapp_number": "27810000099",
+        "evolution_instance": "i", "evolution_api_key": "k", "evolution_api_url": "http://x",
+    }).status_code == 403
+    assert client.post("/admin/migrate-reset", headers=h).status_code == 403
