@@ -1,12 +1,12 @@
 import { useState, useEffect } from 'react'
-import { Routes, Route, useLocation } from 'react-router-dom'
+import { Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import Sidebar from './components/Sidebar.jsx'
 import Queue from './pages/queue/Queue.jsx'
 import Services from './pages/services/Services.jsx'
 import Agents from './pages/agents/Agents.jsx'
 import Tenants from './pages/Tenants.jsx'
 import TenantForm from './pages/TenantForm.jsx'
-import { api, getToken, setToken, clearToken, setUnauthorizedHandler } from './api/client.js'
+import { api, login as apiLogin, getMe, getToken, clearToken, setUnauthorizedHandler } from './api/client.js'
 
 const PAGE_TITLES = {
   '/':                     'Queue',
@@ -24,40 +24,39 @@ function HamburgerIcon() {
 }
 
 function Login({ onAuthed }) {
-  const [value, setValue] = useState('')
-  const [error, setError] = useState('')
+  const [email, setEmail]   = useState('')
+  const [pw, setPw]         = useState('')
+  const [error, setError]   = useState('')
+  const [busy, setBusy]     = useState(false)
 
   async function submit(e) {
     e.preventDefault()
-    const token = value.trim()
-    if (!token) return
-    setToken(token)
+    if (!email.trim() || !pw) return
+    setBusy(true); setError('')
     try {
-      // Validate the token against a guarded endpoint before entering.
-      await api.getTenants()
-      onAuthed()
+      const user = await apiLogin(email.trim(), pw)
+      onAuthed(user)
     } catch (err) {
-      clearToken()
-      setError('Invalid token. Check ADMIN_TOKEN on the server.')
+      setError('Invalid email or password.')
+    } finally {
+      setBusy(false)
     }
   }
+
+  const field = { padding: '10px 12px', borderRadius: 8, border: '1px solid #d1d5db', background: '#fff', color: '#111827', fontSize: 14 }
 
   return (
     <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
       <form onSubmit={submit} style={{ width: '100%', maxWidth: 340, display: 'flex', flexDirection: 'column', gap: 12 }}>
         <h1 style={{ fontSize: 18, fontWeight: 800, letterSpacing: '0.02em' }}>QueueBot Admin</h1>
-        <p style={{ color: 'var(--muted)', fontSize: 13 }}>Enter your admin token to continue.</p>
-        <input
-          type="password"
-          value={value}
-          onChange={e => setValue(e.target.value)}
-          placeholder="Admin token"
-          autoFocus
-          style={{ padding: '10px 12px', borderRadius: 8, border: '1px solid var(--border, #333)', background: 'transparent', color: 'inherit', fontSize: 14 }}
-        />
+        <p style={{ color: 'var(--muted)', fontSize: 13 }}>Sign in to your dashboard.</p>
+        <input type="email" value={email} onChange={e => setEmail(e.target.value)}
+          placeholder="Email" autoFocus autoComplete="username" style={field} />
+        <input type="password" value={pw} onChange={e => setPw(e.target.value)}
+          placeholder="Password" autoComplete="current-password" style={field} />
         {error && <span style={{ color: '#ef4444', fontSize: 12 }}>{error}</span>}
-        <button type="submit" style={{ padding: '10px 12px', borderRadius: 8, border: 'none', background: 'linear-gradient(135deg, #6366f1 0%, #818cf8 100%)', color: '#fff', fontWeight: 700, fontSize: 14, cursor: 'pointer' }}>
-          Sign in
+        <button type="submit" disabled={busy} style={{ padding: '10px 12px', borderRadius: 8, border: 'none', background: 'linear-gradient(135deg, #6366f1 0%, #818cf8 100%)', color: '#fff', fontWeight: 700, fontSize: 14, cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.6 : 1 }}>
+          {busy ? 'Signing in…' : 'Sign in'}
         </button>
       </form>
     </div>
@@ -65,14 +64,25 @@ function Login({ onAuthed }) {
 }
 
 export default function App() {
-  const [authed, setAuthed]           = useState(() => !!getToken())
+  const [user, setUser]               = useState(null)
+  const [booting, setBooting]         = useState(() => !!getToken())  // restoring a session?
   const [tenants, setTenants]         = useState([])
   const [loading, setLoading]         = useState(true)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const location = useLocation()
 
+  const isSuper = !!user?.is_super
+
+  function logout() { clearToken(); setUser(null) }
+
   // Drop back to the login screen whenever the API reports 401.
-  useEffect(() => { setUnauthorizedHandler(() => setAuthed(false)) }, [])
+  useEffect(() => { setUnauthorizedHandler(() => setUser(null)) }, [])
+
+  // Restore an existing session on first load.
+  useEffect(() => {
+    if (!getToken()) return
+    getMe().then(setUser).catch(() => clearToken()).finally(() => setBooting(false))
+  }, [])
 
   // Close sidebar on route change (mobile nav tap)
   useEffect(() => { setSidebarOpen(false) }, [location.pathname])
@@ -90,13 +100,19 @@ export default function App() {
     finally { setLoading(false) }
   }
 
-  useEffect(() => { if (authed) loadTenants() }, [authed])
+  useEffect(() => { if (user) loadTenants() }, [user])
 
   const pageTitle = PAGE_TITLES[location.pathname] ?? 'QueueBot'
 
-  function logout() { clearToken(); setAuthed(false) }
+  if (booting) {
+    return (
+      <div className="pulse" style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)', fontFamily: 'var(--mono)', fontSize: 12, letterSpacing: '0.08em' }}>
+        Loading…
+      </div>
+    )
+  }
 
-  if (!authed) return <Login onAuthed={() => setAuthed(true)} />
+  if (!user) return <Login onAuthed={setUser} />
 
   return (
     <div className="app-layout">
@@ -121,7 +137,7 @@ export default function App() {
       </header>
 
       {/* ── Sidebar (desktop: always visible, mobile: drawer) ──── */}
-      <Sidebar isOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} onLogout={logout} />
+      <Sidebar isOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} onLogout={logout} isSuper={isSuper} />
 
       {/* ── Main content ─────────────────────────────────────────── */}
       <main className="main-content">
@@ -134,9 +150,10 @@ export default function App() {
             <Route path="/"                    element={<Queue      tenants={tenants} />} />
             <Route path="/services"            element={<Services   tenants={tenants} />} />
             <Route path="/agents"              element={<Agents     tenants={tenants} />} />
-            <Route path="/admin/businesses"          element={<Tenants    tenants={tenants} reload={loadTenants} />} />
-            <Route path="/admin/businesses/new"      element={<TenantForm tenants={tenants} reload={loadTenants} />} />
-            <Route path="/admin/businesses/:id/edit" element={<TenantForm tenants={tenants} reload={loadTenants} />} />
+            {/* Business + user management is super-admin only */}
+            <Route path="/admin/businesses"          element={isSuper ? <Tenants    tenants={tenants} reload={loadTenants} /> : <Navigate to="/" replace />} />
+            <Route path="/admin/businesses/new"      element={isSuper ? <TenantForm tenants={tenants} reload={loadTenants} /> : <Navigate to="/" replace />} />
+            <Route path="/admin/businesses/:id/edit" element={isSuper ? <TenantForm tenants={tenants} reload={loadTenants} /> : <Navigate to="/" replace />} />
           </Routes>
         )}
       </main>
