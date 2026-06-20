@@ -24,7 +24,12 @@
    ```
    DATABASE_URL=postgres://postgres:<password>@<project>_booking-db:5432/whatsapp_bot
    REDIS_URL=redis://default:<password>@<project>_evolution-api-redis:6379
+   ADMIN_TOKEN=<long-random-secret>          # REQUIRED — guards every /admin/* route
+   ALLOWED_ORIGINS=https://your-admin-url.easypanel.host   # CORS allow-list (defaults to *)
+   TZ=Africa/Johannesburg
    ```
+   - `ADMIN_TOKEN` **must be set** or all admin endpoints return `503`. Generate one e.g. `openssl rand -hex 32`.
+   - `ALLOWED_ORIGINS` is comma-separated; set it to your admin URL in production instead of `*`.
 5. Deploy
 
 6. Once live, hit `POST https://your-bot-url/admin/seed` to insert your first tenant.
@@ -54,9 +59,41 @@
 
 ---
 
-## Locking down the admin (recommended)
+## Admin authentication
 
-Since there's no login, restrict `/admin/*` routes via EasyPanel:
-- Go to your bot service → **Domains** → add a separate internal domain for admin
-- Or add a simple API key middleware to `main.py` when you're ready
+Every `/admin/*` route now requires an `x-admin-token` header matching the
+server's `ADMIN_TOKEN`. The React dashboard shows a **login screen** on first
+load: paste the same `ADMIN_TOKEN` value. It is stored in the browser's
+`localStorage` (never baked into the build) and sent on every request. Use
+**Sign out** in the sidebar to clear it.
+
+Defense in depth: still deploy the admin UI on a private/separate domain. The
+token is a shared secret — anyone who has it has full admin access.
+
+`/health` stays public for uptime checks. `/webhook` stays public for Evolution.
+
+---
+
+## Testing
+
+```
+pip install -r requirements-dev.txt
+pytest                       # runs unit + sqlite-backed integration tests
+```
+
+No Postgres/Redis needed for the test suite (uses a temp SQLite DB; health-check
+redis errors are tolerated).
+
+---
+
+## Known limitations (not yet hardened)
+
+- **WhatsApp send is synchronous** (`requests`) inside the async webhook, so
+  concurrent webhooks serialise. Fine at small-business volume; move to a
+  background task / async client if throughput grows.
+- **No per-customer concurrency lock.** Duplicate *retries* are dropped via
+  message-id idempotency, but two genuinely simultaneous messages from one
+  customer are not serialised.
+- **Legacy data:** family bookings created before the party-linkage fix may not
+  fully cancel as one. New bookings are fine.
 
