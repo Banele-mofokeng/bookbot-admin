@@ -40,14 +40,14 @@ function TextInput({ value, onChange, placeholder, type = 'text', error }) {
       onChange={onChange}
       placeholder={placeholder}
       style={{
-        background: 'var(--surface2)',
-        border: `1px solid ${error ? 'var(--red)' : 'var(--border2)'}`,
+        background: '#ffffff',
+        border: `1px solid ${error ? 'var(--red)' : '#d1d5db'}`,
         borderRadius: 8, padding: '10px 14px', fontSize: 13,
         color: 'var(--text)', outline: 'none', width: '100%',
-        fontFamily: 'var(--sans)',
+        fontFamily: 'var(--sans)', boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
       }}
       onFocus={e => { if (!error) e.target.style.borderColor = 'var(--accent)' }}
-      onBlur={e => { if (!error) e.target.style.borderColor = 'var(--border2)' }}
+      onBlur={e => { if (!error) e.target.style.borderColor = '#d1d5db' }}
     />
   )
 }
@@ -61,13 +61,13 @@ function NumberInput({ value, onChange, min, max }) {
       max={max}
       onChange={onChange}
       style={{
-        background: 'var(--surface2)', border: '1px solid var(--border2)',
+        background: '#ffffff', border: '1px solid #d1d5db',
         borderRadius: 8, padding: '10px 14px', fontSize: 13,
         color: 'var(--text)', outline: 'none', width: '100%',
-        fontFamily: 'var(--sans)',
+        fontFamily: 'var(--sans)', boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
       }}
       onFocus={e => e.target.style.borderColor = 'var(--accent)'}
-      onBlur={e => e.target.style.borderColor = 'var(--border2)'}
+      onBlur={e => e.target.style.borderColor = '#d1d5db'}
     />
   )
 }
@@ -137,7 +137,7 @@ export default function TenantForm({ tenants, reload }) {
         show('Business updated.', 'success')
       } else {
         await api.createTenant(form)
-        show('Business registered!', 'success')
+        show('Business registered.', 'success')
       }
       await reload()
       navigate('/admin/businesses')
@@ -163,7 +163,7 @@ export default function TenantForm({ tenants, reload }) {
 
         {/* ── Business Info ── */}
         <SectionHeader label="Business Info" />
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        <div className="form-page-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
           <Field label="Business Name" error={errors.business_name}>
             <TextInput value={form.business_name} onChange={setText('business_name')}
               placeholder="e.g. Porsche Hair Salon" error={errors.business_name} />
@@ -186,7 +186,7 @@ export default function TenantForm({ tenants, reload }) {
 
         {/* ── Labels ── */}
         <SectionHeader label="Custom Labels" sub="Makes the bot speak the language of this business" />
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        <div className="form-page-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
           <Field label="Agent Label" hint="Who serves the customer">
             <TextInput value={form.agent_label} onChange={setText('agent_label')}
               placeholder="Stylist / Doctor / Bay / Technician" />
@@ -201,7 +201,7 @@ export default function TenantForm({ tenants, reload }) {
 
         {/* ── Queue Config ── */}
         <SectionHeader label="Queue Config" />
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16 }}>
+        <div className="form-page-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16 }}>
           <Field label="Opens (24h)" hint="e.g. 8 = 08:00">
             <NumberInput value={form.queue_opens} onChange={setNum('queue_opens')} min={0} max={23} />
           </Field>
@@ -218,7 +218,7 @@ export default function TenantForm({ tenants, reload }) {
         {/* ── Evolution API ── */}
         <SectionHeader label="Evolution API Config" />
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+          <div className="form-page-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
             <Field label="Instance Name" error={errors.evolution_instance}>
               <TextInput value={form.evolution_instance} onChange={setText('evolution_instance')}
                 placeholder="e.g. PorscheHairSalon" error={errors.evolution_instance} />

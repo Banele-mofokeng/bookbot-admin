@@ -16,8 +16,8 @@ const STATUS_NEXT = {
 }
 
 const STATUS_LABEL = {
-  Waiting:   'In Service',
-  InService: 'Done',
+  Waiting:   'Start service',
+  InService: 'Mark done',
 }
 
 function formatDateOption(dateStr) {
@@ -79,7 +79,7 @@ function WalkinModal({ tenant, services, agents, onClose, onAdd }) {
   }
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.72)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 300, padding: 16 }}>
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(17,24,39,0.45)', backdropFilter: 'blur(4px)', WebkitBackdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 300, padding: 16 }}>
       <Card className="walkin-modal-card animate-fade-up">
         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 4 }}>
           <div style={{ fontSize: 16, fontWeight: 800 }}>Add Walk-in</div>
@@ -93,7 +93,7 @@ function WalkinModal({ tenant, services, agents, onClose, onAdd }) {
         <div style={{ fontSize: 12, color: isAfterHours ? 'var(--amber)' : 'var(--muted)', marginBottom: 20 }}>
           {isAfterHours
             ? `⚠️ Queue is closed — opens at ${String(tenant?.queue_opens || 8).padStart(2,'0')}:00`
-            : 'Add a customer who arrived in person'}
+            : 'Add a walk-in to the queue'}
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <Input label="Customer Name *" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Thabo Nkosi" />
@@ -181,10 +181,11 @@ export default function Queue({ tenants }) {
   const agentLabel = selectedTenant?.agent_label || 'Agent'
 
   const selectStyle = {
-    background: 'var(--surface2)', border: '1px solid var(--border2)',
+    background: '#ffffff', border: '1px solid #d1d5db',
     borderRadius: 8, padding: '8px 14px', fontSize: 13,
     color: 'var(--text)', fontFamily: 'var(--sans)', fontWeight: 600,
     outline: 'none', cursor: 'pointer', maxWidth: '100%',
+    boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
   }
 
   return (
@@ -217,17 +218,17 @@ export default function Queue({ tenants }) {
             ))}
           </select>
           {isToday && (
-            <Button variant="outline" onClick={() => setShowWalkin(true)}>+ Walk-in</Button>
+            <Button variant="primary" onClick={() => setShowWalkin(true)}>+ Walk-in</Button>
           )}
-          <Button variant="ghost" size="sm" onClick={loadQueue} loading={loading}>↻</Button>
+          <Button variant="ghost" size="sm" onClick={loadQueue} loading={loading} aria-label="Refresh queue">↻</Button>
         </div>
       </div>
 
       {/* ── Stats ───────────────────────────────────────────────── */}
       <div className="stats-grid">
-        <StatCard label="Waiting"    value={waiting.length}   color="var(--blue)"   sub="in queue"     delay={0} />
-        <StatCard label="In Service" value={inService.length} color="var(--amber)"  sub="being served" delay={60} />
-        <StatCard label="Served"     value={done.length}      color="var(--accent)" sub="completed"    delay={120} />
+        <StatCard label="Waiting"    value={waiting.length}   color="var(--blue)"  sub="in queue"     delay={0} />
+        <StatCard label="In Service" value={inService.length} color="var(--amber)" sub="being served" delay={60} />
+        <StatCard label="Served"     value={done.length}      color="var(--green)" sub="completed"    delay={120} />
       </div>
 
       {/* ── Table ───────────────────────────────────────────────── */}
@@ -235,12 +236,15 @@ export default function Queue({ tenants }) {
         {loading && queue.length === 0 ? (
           <Loading message="Loading queue..." />
         ) : queue.length === 0 ? (
-          <Empty message={`No queue entries for ${formatDateOption(selectedDate)}.`} />
+          <Empty
+            message={`No entries for ${formatDateOption(selectedDate)}.`}
+            hint={isToday ? "Add a walk-in or wait for WhatsApp bookings." : undefined}
+          />
         ) : (
           <div className="table-wrap">
             <table className="queue-table">
               <thead>
-                <tr style={{ background: 'var(--surface2)', borderBottom: '1px solid var(--border)' }}>
+                <tr style={{ background: '#f8f9fb', borderBottom: '1px solid #e5e7eb' }}>
                   {['#', 'Customer', 'Service', agentLabel, 'ETA', 'Via', 'Status', ''].map(h => (
                     <th key={h} style={{ padding: '11px 16px', textAlign: 'left', fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--muted)', fontWeight: 500, whiteSpace: 'nowrap' }}>{h}</th>
                   ))}
@@ -252,7 +256,7 @@ export default function Queue({ tenants }) {
                   return (
                     <tr key={entry.id}
                       style={{ borderBottom: i < queue.length - 1 ? '1px solid var(--border)' : 'none', transition: 'background 0.12s', opacity: faded ? 0.45 : 1 }}
-                      onMouseEnter={e => e.currentTarget.style.background = 'var(--surface2)'}
+                      onMouseEnter={e => e.currentTarget.style.background = '#f8f9fb'}
                       onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
                     >
                       {/* Position */}

@@ -87,7 +87,7 @@ export default function Services({ tenants }) {
         <div className="page-header-actions">
           {tenants.length > 1 && (
             <select value={selectedTenantId || ''} onChange={e => setSelectedTenantId(parseInt(e.target.value))}
-              style={{ background: 'var(--surface2)', border: '1px solid var(--border2)', borderRadius: 8, padding: '8px 14px', fontSize: 13, color: 'var(--text)', fontFamily: 'var(--sans)', fontWeight: 600, outline: 'none', cursor: 'pointer' }}>
+              style={{ background: '#ffffff', border: '1px solid #d1d5db', borderRadius: 8, padding: '8px 14px', fontSize: 13, color: 'var(--text)', fontFamily: 'var(--sans)', fontWeight: 600, outline: 'none', cursor: 'pointer', boxShadow: '0 1px 2px rgba(0,0,0,0.04)' }}>
               {tenants.map(t => <option key={t.id} value={t.id}>{t.business_name}</option>)}
             </select>
           )}
@@ -102,7 +102,7 @@ export default function Services({ tenants }) {
       )}
 
       {loading ? <Loading message="Loading services..." /> : services.length === 0 && !adding ? (
-        <Card><Empty message="No services yet. Add your first one." /></Card>
+        <Card><Empty message="No services yet." hint="Use '+ Add Service' to create one." /></Card>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {services.map((svc, i) => (
@@ -114,8 +114,8 @@ export default function Services({ tenants }) {
               <Card key={svc.id} className="animate-fade-up" style={{ padding: '16px 20px', animationDelay: `${i * 40}ms` }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-                    <div style={{ width: 40, height: 40, background: 'var(--accent-dim)', borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--accent)', fontWeight: 700 }}>
-                      {svc.duration_minutes}m
+                    <div style={{ width: 40, height: 40, background: 'var(--accent-dim)', borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--accent)', fontWeight: 700 }}>
+                      {formatDuration(svc.duration_minutes)}
                     </div>
                     <div>
                       <div style={{ fontWeight: 700, fontSize: 14 }}>{svc.name}</div>
