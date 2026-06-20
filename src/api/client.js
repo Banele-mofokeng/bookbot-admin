@@ -1,8 +1,8 @@
 const BASE = import.meta.env.VITE_API_URL || ''
 
-// Admin token — entered at the login gate and kept in localStorage so it is
-// never baked into the built bundle. Sent on every admin request.
-const TOKEN_KEY = 'admin_token'
+// JWT from /auth/login, kept in localStorage (never baked into the bundle) and
+// sent as a Bearer token on every request.
+const TOKEN_KEY = 'auth_token'
 export const getToken   = () => localStorage.getItem(TOKEN_KEY) || ''
 export const setToken   = (t) => localStorage.setItem(TOKEN_KEY, t)
 export const clearToken = () => localStorage.removeItem(TOKEN_KEY)
@@ -12,10 +12,11 @@ let onUnauthorized = () => {}
 export const setUnauthorizedHandler = (fn) => { onUnauthorized = fn }
 
 async function request(path, options = {}) {
+  const token = getToken()
   const res = await fetch(`${BASE}${path}`, {
     headers: {
       'Content-Type': 'application/json',
-      'x-admin-token': getToken(),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(options.headers || {}),
     },
     ...options,
@@ -31,6 +32,18 @@ async function request(path, options = {}) {
   }
   return res.json()
 }
+
+// ── Auth ───────────────────────────────────────────────────────────────────
+export async function login(email, password) {
+  const data = await request('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+  })
+  setToken(data.access_token)
+  return data.user
+}
+
+export const getMe = () => request('/auth/me')
 
 export const api = {
   // Tenants
@@ -52,4 +65,9 @@ export const api = {
   getQueue:      (tenantId, date) => request(`/admin/queue/${tenantId}${date ? `?queue_date=${date}` : ''}`),
   updateStatus:  (entryId, status) => request(`/admin/queue/${entryId}/status`, { method: 'PATCH', body: JSON.stringify({ status }) }),
   addWalkin:     (data)     => request('/admin/queue/walkin', { method: 'POST', body: JSON.stringify(data) }),
+
+  // Users (super-admin only) — provision client logins
+  getUsers:      ()         => request('/admin/users'),
+  createUser:    (data)     => request('/admin/users', { method: 'POST', body: JSON.stringify(data) }),
+  updateUser:    (id, data) => request(`/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
 }

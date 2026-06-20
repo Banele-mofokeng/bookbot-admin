@@ -15,7 +15,15 @@ const NAV = [
   },
 ]
 
-export default function Sidebar({ isOpen, onClose, onLogout }) {
+const SUPER_NAV = [
+  {
+    to: '/admin/businesses', label: 'Businesses',
+    icon: <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 14V6l6-4 6 4v8" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/><path d="M6 14V9h4v5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+  },
+]
+
+export default function Sidebar({ isOpen, onClose, onLogout, isSuper }) {
+  const navItems = isSuper ? [...NAV, ...SUPER_NAV] : NAV
   return (
     <>
       {/* Dark overlay — only visible on mobile when open */}
@@ -55,7 +63,7 @@ export default function Sidebar({ isOpen, onClose, onLogout }) {
 
         {/* Nav links */}
         <nav style={{ padding: '12px 0', flex: 1 }}>
-          {NAV.map(({ to, label, icon }) => (
+          {navItems.map(({ to, label, icon }) => (
             <NavLink key={to} to={to} end={to === '/'} onClick={onClose}
               style={({ isActive }) => ({
                 display: 'flex', alignItems: 'center', gap: 10,

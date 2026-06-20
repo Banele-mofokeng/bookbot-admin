@@ -26,7 +26,7 @@ export function Badge({ children, color = 'green' }) {
 }
 
 // ── Button ─────────────────────────────────────────────────────────────────
-export function Button({ children, onClick, variant = 'primary', size = 'md', disabled, loading, style, title }) {
+export function Button({ children, onClick, variant = 'primary', size = 'md', disabled, loading, style, title, type = 'button' }) {
   const [hovered, setHovered] = useState(false)
   const isDisabled = disabled || loading
 
@@ -54,6 +54,7 @@ export function Button({ children, onClick, variant = 'primary', size = 'md', di
   }
   return (
     <button
+      type={type}
       title={title}
       style={{ ...base, ...sizes[size], ...variants[variant] }}
       onClick={onClick}
