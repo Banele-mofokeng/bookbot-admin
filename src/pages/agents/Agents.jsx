@@ -43,9 +43,9 @@ function AgentForm({ tenantId, agent, services, onSave, onCancel }) {
                 style={{
                   padding: '6px 14px', borderRadius: 20, fontSize: 12, fontWeight: 700, cursor: 'pointer',
                   fontFamily: 'var(--sans)', transition: 'all 0.15s',
-                  background: selectedSvcs.includes(svc.id) ? 'var(--accent)' : 'var(--surface2)',
-                  color: selectedSvcs.includes(svc.id) ? '#0b0b0e' : 'var(--muted2)',
-                  border: `1px solid ${selectedSvcs.includes(svc.id) ? 'var(--accent)' : 'var(--border2)'}`,
+                  background: selectedSvcs.includes(svc.id) ? 'var(--accent)' : '#f3f4f6',
+                  color: selectedSvcs.includes(svc.id) ? '#fff' : 'var(--muted2)',
+                  border: `1px solid ${selectedSvcs.includes(svc.id) ? 'var(--accent)' : '#e5e7eb'}`,
                 }}>
                 {svc.name}
               </button>
@@ -106,12 +106,13 @@ export default function Agents({ tenants }) {
         <div className="page-header-actions">
           {tenants.length > 1 && (
             <select value={selectedTenantId || ''} onChange={e => setSelectedTenantId(parseInt(e.target.value))}
-              style={{ background: 'var(--surface2)', border: '1px solid var(--border2)', borderRadius: 8, padding: '8px 14px', fontSize: 13, color: 'var(--text)', fontFamily: 'var(--sans)', fontWeight: 600, outline: 'none', cursor: 'pointer' }}>
+              style={{ background: '#ffffff', border: '1px solid #d1d5db', borderRadius: 8, padding: '8px 14px', fontSize: 13, color: 'var(--text)', fontFamily: 'var(--sans)', fontWeight: 600, outline: 'none', cursor: 'pointer', boxShadow: '0 1px 2px rgba(0,0,0,0.04)' }}>
               {tenants.map(t => <option key={t.id} value={t.id}>{t.business_name}</option>)}
             </select>
           )}
           <Button onClick={() => { setAdding(true); setEditing(null) }}
-            disabled={services.filter(s => s.is_active).length === 0}>
+            disabled={services.filter(s => s.is_active).length === 0}
+            title={services.filter(s => s.is_active).length === 0 ? 'Add services before creating agents' : undefined}>
             + Add {tenant?.agent_label || 'Agent'}
           </Button>
         </div>
@@ -132,7 +133,7 @@ export default function Agents({ tenants }) {
       )}
 
       {loading ? <Loading message="Loading agents..." /> : agents.length === 0 && !adding ? (
-        <Card><Empty message={`No ${tenant?.agent_label?.toLowerCase() || 'agent'}s yet.`} /></Card>
+        <Card><Empty message={`No ${tenant?.agent_label?.toLowerCase() || 'agent'}s yet.`} hint={`Use '+ Add ${tenant?.agent_label || 'Agent'}' to create one.`} /></Card>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {agents.map((agent, i) => (
@@ -144,7 +145,7 @@ export default function Agents({ tenants }) {
               <Card key={agent.id} className="animate-fade-up" style={{ padding: '16px 20px', animationDelay: `${i * 40}ms` }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-                    <div style={{ width: 40, height: 40, background: 'var(--surface3)', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16, fontWeight: 800, color: 'var(--text)' }}>
+                    <div style={{ width: 40, height: 40, background: 'var(--accent-dim)', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16, fontWeight: 800, color: 'var(--accent)' }}>
                       {agent.name.charAt(0).toUpperCase()}
                     </div>
                     <div>
