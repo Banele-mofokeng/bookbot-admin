@@ -11,13 +11,13 @@ import pytest
 from sqlalchemy import text
 from sqlmodel import Session, select
 
-import main
-from main import (QueueEntry, OutboxMessage, Tenant, Service, Agent,
-                  AgentService, AgentSchedule, AgentBlock)
+from app import db
+from app.models import (QueueEntry, OutboxMessage, Tenant, Service, Agent, AgentService,
+                        AgentSchedule, AgentBlock, MenuItem, Order, OrderItem)
 
 
 def _index_names():
-    with main.engine.connect() as conn:
+    with db.engine.connect() as conn:
         rows = conn.execute(text(
             "SELECT name FROM sqlite_master WHERE type = 'index'"
         )).fetchall()
@@ -26,8 +26,8 @@ def _index_names():
 
 def _plan(stmt) -> str:
     """EXPLAIN QUERY PLAN for a SQLModel select, as one string."""
-    compiled = stmt.compile(main.engine, compile_kwargs={"literal_binds": True})
-    with main.engine.connect() as conn:
+    compiled = stmt.compile(db.engine, compile_kwargs={"literal_binds": True})
+    with db.engine.connect() as conn:
         rows = conn.execute(text(f"EXPLAIN QUERY PLAN {compiled}")).fetchall()
     return " | ".join(str(r) for r in rows)
 
@@ -35,26 +35,27 @@ def _plan(stmt) -> str:
 # ── creation ─────────────────────────────────────────────────────────────────
 def test_every_declared_index_exists():
     present = _index_names()
-    missing = [name for name, _, _ in main.INDEXES if name not in present]
+    missing = [name for name, _, _ in db.INDEXES if name not in present]
     assert not missing, f"missing indexes: {missing}"
 
 
 def test_ensure_indexes_is_idempotent():
     """Runs on every boot — a second call must not error."""
-    main.ensure_indexes()
-    main.ensure_indexes()
+    db.ensure_indexes()
+    db.ensure_indexes()
     present = _index_names()
-    assert all(name in present for name, _, _ in main.INDEXES)
+    assert all(name in present for name, _, _ in db.INDEXES)
 
 
 def test_index_tables_match_the_models():
     """Table names are taken from the models, so they can't drift on a rename."""
-    tables = {t for _, t, _ in main.INDEXES}
+    tables = {t for _, t, _ in db.INDEXES}
     assert tables == {
         QueueEntry.__tablename__, OutboxMessage.__tablename__,
         Service.__tablename__, Agent.__tablename__,
         AgentService.__tablename__, Tenant.__tablename__,
         AgentSchedule.__tablename__, AgentBlock.__tablename__,
+        MenuItem.__tablename__, Order.__tablename__, OrderItem.__tablename__,
     }
 
 
@@ -135,7 +136,7 @@ def test_lookup_tables_are_indexed(stmt_factory, expected):
 # ── behaviour is unchanged ───────────────────────────────────────────────────
 def test_results_are_identical_with_indexes():
     """An index must change speed, never answers."""
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         t = Tenant(business_name="T", whatsapp_number="27810000000",
                    evolution_instance="i", evolution_api_key="k",
                    evolution_api_url="http://x")

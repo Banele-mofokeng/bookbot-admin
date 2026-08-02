@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
+from app import config
 
 # Anything that isn't messages.upsert short-circuits at the top of the handler.
 IGNORED_EVENT = {"event": "connection.update", "data": {}}
@@ -20,13 +21,13 @@ def client():
 @pytest.fixture
 def secret(monkeypatch):
     """Turn webhook auth on for one test."""
-    monkeypatch.setattr(main, "WEBHOOK_SECRETS", ["s3cret"])
+    monkeypatch.setattr(config, "WEBHOOK_SECRETS", ["s3cret"])
     return "s3cret"
 
 
 def test_open_when_no_secret_configured(client, monkeypatch):
     """Unconfigured deployments keep working — the upgrade must not go silent."""
-    monkeypatch.setattr(main, "WEBHOOK_SECRETS", [])
+    monkeypatch.setattr(config, "WEBHOOK_SECRETS", [])
     r = client.post("/webhook", json=IGNORED_EVENT)
     assert r.status_code == 200
     assert r.json() == {"status": "ignored"}
@@ -71,7 +72,7 @@ def test_rejects_wrong_query_param(client, secret):
 
 def test_rotation_accepts_both_secrets(client, monkeypatch):
     """'old,new' lets Evolution be repointed without dropping bookings."""
-    monkeypatch.setattr(main, "WEBHOOK_SECRETS", ["old", "new"])
+    monkeypatch.setattr(config, "WEBHOOK_SECRETS", ["old", "new"])
     for token in ("old", "new"):
         r = client.post("/webhook", json=IGNORED_EVENT,
                         headers={"X-Webhook-Token": token})
@@ -91,7 +92,7 @@ def test_non_ascii_secret_is_rejected_not_crashed(client, secret):
 
 
 def test_health_reports_webhook_auth_state(client, monkeypatch):
-    monkeypatch.setattr(main, "WEBHOOK_SECRETS", ["s3cret"])
+    monkeypatch.setattr(config, "WEBHOOK_SECRETS", ["s3cret"])
     assert client.get("/health").json()["webhook_auth"] is True
-    monkeypatch.setattr(main, "WEBHOOK_SECRETS", [])
+    monkeypatch.setattr(config, "WEBHOOK_SECRETS", [])
     assert client.get("/health").json()["webhook_auth"] is False

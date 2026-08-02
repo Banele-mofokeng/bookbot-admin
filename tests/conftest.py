@@ -1,7 +1,7 @@
 """
 Shared test setup. Points the app at a throwaway SQLite file BEFORE main is
 imported, so the real engine binds to it. Integration tests then use the same
-main.engine. No Postgres or Redis instance required for these tests.
+db.engine. No Postgres or Redis instance required for these tests.
 """
 import os
 import tempfile
@@ -17,21 +17,22 @@ os.environ["SUPERADMIN_PASSWORD"] = "superpass123"
 import pytest
 from sqlmodel import SQLModel
 import main
+from app import auth, db
 
 
 @pytest.fixture(autouse=True)
 def fresh_db():
     """Recreate all tables before each test, with the super-admin seeded."""
-    SQLModel.metadata.drop_all(main.engine)
-    SQLModel.metadata.create_all(main.engine)
+    SQLModel.metadata.drop_all(db.engine)
+    SQLModel.metadata.create_all(db.engine)
     # Same indexes production runs with, so queries are exercised as deployed.
-    main.ensure_indexes()
+    db.ensure_indexes()
     # Drop every pooled connection. A SQLite connection carries its own cached
     # copy of the schema; one checked out before this drop/create cycle can go
     # on planning against the old one and ignore indexes that now exist. Fresh
     # connections per test, rather than a subtly stale pool.
-    main.engine.dispose()
-    main.seed_superadmin()
+    db.engine.dispose()
+    auth.seed_superadmin()
     yield
 
 

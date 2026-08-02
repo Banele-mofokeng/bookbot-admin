@@ -24,8 +24,8 @@ from datetime import datetime, timedelta
 import pytest
 from sqlmodel import Session, select
 
-import main
-from main import Tenant, Service, Agent, AgentService, QueueEntry
+from app import core, db, queue_engine
+from app.models import Tenant, Service, Agent, AgentService, QueueEntry
 
 
 DATE = "2026-06-20"
@@ -41,13 +41,13 @@ def at(hour, minute=0):
 @pytest.fixture
 def frozen_now(monkeypatch):
     """Freeze now() at 10:00 on DATE. Returns it so tests can do arithmetic."""
-    monkeypatch.setattr(main, "now", lambda: NOW)
+    monkeypatch.setattr(core, "now", lambda: NOW)
     return NOW
 
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 def _tenant(opens=OPENS, closes=CLOSES):
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         t = Tenant(
             business_name="Pin Co", whatsapp_number="27810000000",
             evolution_instance="i", evolution_api_key="k",
@@ -59,7 +59,7 @@ def _tenant(opens=OPENS, closes=CLOSES):
 
 
 def _service(tenant_id, minutes, name=None):
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         sv = Service(tenant_id=tenant_id, name=name or f"S{minutes}",
                      duration_minutes=minutes)
         s.add(sv); s.commit(); s.refresh(sv)
@@ -67,7 +67,7 @@ def _service(tenant_id, minutes, name=None):
 
 
 def _agent(tenant_id, service_ids=(), name="A"):
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         a = Agent(tenant_id=tenant_id, name=name)
         s.add(a); s.commit(); s.refresh(a)
         for sid in service_ids:
@@ -91,7 +91,7 @@ def _entry(tenant_id, service_id, agent_id, *, status="Waiting",
            date=DATE, name="C", position=0):
     """Entries default to strictly increasing joined_at, in creation order."""
     _joined_seq[0] += 1
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         e = QueueEntry(
             tenant_id=tenant_id, service_id=service_id, agent_id=agent_id,
             customer_number="2781000", customer_name=name, status=status,
@@ -104,7 +104,7 @@ def _entry(tenant_id, service_id, agent_id, *, status="Waiting",
 
 
 def _read(entry_id):
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         return s.get(QueueEntry, entry_id)
 
 
@@ -113,37 +113,37 @@ def _read(entry_id):
 # =============================================================================
 def test_ces_anchors_to_now_once_the_queue_has_opened(frozen_now):
     t = _tenant()
-    assert main.calculate_estimated_start(t, 1, DATE, 90) == at(11, 30)
+    assert queue_engine.calculate_estimated_start(t, 1, DATE, 90) == at(11, 30)
 
 
 def test_ces_anchors_to_opening_time_before_the_queue_opens(monkeypatch):
-    monkeypatch.setattr(main, "now", lambda: at(7, 0))
+    monkeypatch.setattr(core, "now", lambda: at(7, 0))
     t = _tenant()
     # Not 08:30 from 07:00 — the base is opening time, not the current time.
-    assert main.calculate_estimated_start(t, 1, DATE, 90) == at(9, 30)
+    assert queue_engine.calculate_estimated_start(t, 1, DATE, 90) == at(9, 30)
 
 
 def test_ces_zero_backlog_is_the_base_itself(frozen_now):
     t = _tenant()
-    assert main.calculate_estimated_start(t, 1, DATE, 0) == NOW
+    assert queue_engine.calculate_estimated_start(t, 1, DATE, 0) == NOW
 
 
 def test_ces_declared_arrival_pushes_the_start_later(frozen_now):
     t = _tenant()
-    assert main.calculate_estimated_start(
+    assert queue_engine.calculate_estimated_start(
         t, 1, DATE, 90, earliest_arrival=at(13, 0)) == at(13, 0)
 
 
 def test_ces_declared_arrival_earlier_than_the_queue_is_ignored(frozen_now):
     """You can't jump the queue by claiming an early arrival."""
     t = _tenant()
-    assert main.calculate_estimated_start(
+    assert queue_engine.calculate_estimated_start(
         t, 1, DATE, 90, earliest_arrival=at(9, 0)) == at(11, 30)
 
 
 def test_ces_for_a_future_date_anchors_to_that_days_opening(frozen_now):
     t = _tenant()
-    assert main.calculate_estimated_start(t, 1, "2026-06-21", 60) == \
+    assert queue_engine.calculate_estimated_start(t, 1, "2026-06-21", 60) == \
         datetime(2026, 6, 21, 9, 0)
 
 
@@ -157,8 +157,8 @@ def test_ces_QUIRK_ignores_closing_time_entirely(frozen_now):
     nobody can honour or refusing the booking outright.
     """
     t = _tenant(opens=8, closes=17)
-    assert main.calculate_estimated_start(t, 1, DATE, 600) == at(20, 0)
-    assert main.calculate_estimated_start(t, 1, DATE, 20 * 60) == \
+    assert queue_engine.calculate_estimated_start(t, 1, DATE, 600) == at(20, 0)
+    assert queue_engine.calculate_estimated_start(t, 1, DATE, 20 * 60) == \
         datetime(2026, 6, 21, 6, 0)
 
 
@@ -167,34 +167,34 @@ def test_ces_QUIRK_ignores_closing_time_entirely(frozen_now):
 # =============================================================================
 def test_backlog_of_an_empty_queue_is_zero(frozen_now):
     t = _tenant(); svc = _service(t.id, 60); a = _agent(t.id, [svc])
-    assert main.get_agent_backlog_minutes(a, t.id, DATE) == 0
+    assert queue_engine.get_agent_backlog_minutes(a, t.id, DATE) == 0
 
 
 def test_backlog_without_an_estimated_start_is_the_full_duration(frozen_now):
     t = _tenant(); svc = _service(t.id, 45); a = _agent(t.id, [svc])
     _entry(t.id, svc, a)
-    assert main.get_agent_backlog_minutes(a, t.id, DATE) == 45
+    assert queue_engine.get_agent_backlog_minutes(a, t.id, DATE) == 45
 
 
 def test_backlog_of_a_scheduled_waiting_entry_runs_to_its_finish(frozen_now):
     """estimated_start 10:30 + 60min = finishes 11:30, i.e. 90 min from now."""
     t = _tenant(); svc = _service(t.id, 60); a = _agent(t.id, [svc])
     _entry(t.id, svc, a, estimated_start=at(10, 30))
-    assert main.get_agent_backlog_minutes(a, t.id, DATE) == 90
+    assert queue_engine.get_agent_backlog_minutes(a, t.id, DATE) == 90
 
 
 def test_backlog_of_a_waiting_entry_never_drops_below_its_duration(frozen_now):
     """Scheduled to have finished at 09:00, but it hasn't started — still 60."""
     t = _tenant(); svc = _service(t.id, 60); a = _agent(t.id, [svc])
     _entry(t.id, svc, a, estimated_start=at(8, 0))
-    assert main.get_agent_backlog_minutes(a, t.id, DATE) == 60
+    assert queue_engine.get_agent_backlog_minutes(a, t.id, DATE) == 60
 
 
 def test_backlog_of_an_inservice_entry_is_only_the_time_remaining(frozen_now):
     """Started 09:30, 60min service — 30 left, not 60."""
     t = _tenant(); svc = _service(t.id, 60); a = _agent(t.id, [svc])
     _entry(t.id, svc, a, status="InService", estimated_start=at(9, 30))
-    assert main.get_agent_backlog_minutes(a, t.id, DATE) == 30
+    assert queue_engine.get_agent_backlog_minutes(a, t.id, DATE) == 30
 
 
 def test_backlog_of_an_overrunning_inservice_entry_is_zero(frozen_now):
@@ -204,7 +204,7 @@ def test_backlog_of_an_overrunning_inservice_entry_is_zero(frozen_now):
     """
     t = _tenant(); svc = _service(t.id, 60); a = _agent(t.id, [svc])
     _entry(t.id, svc, a, status="InService", estimated_start=at(8, 0))
-    assert main.get_agent_backlog_minutes(a, t.id, DATE) == 0
+    assert queue_engine.get_agent_backlog_minutes(a, t.id, DATE) == 0
 
 
 def test_backlog_QUIRK_a_late_appointment_counts_its_idle_wait_as_backlog(frozen_now):
@@ -216,7 +216,7 @@ def test_backlog_QUIRK_a_late_appointment_counts_its_idle_wait_as_backlog(frozen
     """
     t = _tenant(); svc = _service(t.id, 60); a = _agent(t.id, [svc])
     _entry(t.id, svc, a, estimated_start=at(16, 0), earliest_arrival=at(16, 0))
-    assert main.get_agent_backlog_minutes(a, t.id, DATE) == 420
+    assert queue_engine.get_agent_backlog_minutes(a, t.id, DATE) == 420
 
 
 def test_backlog_sums_across_entries(frozen_now):
@@ -224,14 +224,14 @@ def test_backlog_sums_across_entries(frozen_now):
     _entry(t.id, svc, a, status="InService", estimated_start=at(9, 45))  # 15 left
     _entry(t.id, svc, a)                                                 # 30 flat
     _entry(t.id, svc, a, estimated_start=at(10, 45))                     # -> 11:15, 75
-    assert main.get_agent_backlog_minutes(a, t.id, DATE) == 15 + 30 + 75
+    assert queue_engine.get_agent_backlog_minutes(a, t.id, DATE) == 15 + 30 + 75
 
 
 def test_backlog_excludes_terminal_statuses(frozen_now):
     t = _tenant(); svc = _service(t.id, 60); a = _agent(t.id, [svc])
     for st in ("Done", "NoShow", "Cancelled"):
         _entry(t.id, svc, a, status=st)
-    assert main.get_agent_backlog_minutes(a, t.id, DATE) == 0
+    assert queue_engine.get_agent_backlog_minutes(a, t.id, DATE) == 0
 
 
 def test_backlog_excludes_other_agents_dates_and_tenants(frozen_now):
@@ -244,14 +244,14 @@ def test_backlog_excludes_other_agents_dates_and_tenants(frozen_now):
     _entry(t2.id, svc2, a2)                        # other tenant
     _entry(t.id, svc, a)                           # the only one that counts
 
-    assert main.get_agent_backlog_minutes(a, t.id, DATE) == 60
+    assert queue_engine.get_agent_backlog_minutes(a, t.id, DATE) == 60
 
 
 def test_backlog_exclude_entry_id_skips_that_entry(frozen_now):
     t = _tenant(); svc = _service(t.id, 60); a = _agent(t.id, [svc])
     keep = _entry(t.id, svc, a)
     drop = _entry(t.id, svc, a)
-    assert main.get_agent_backlog_minutes(a, t.id, DATE, exclude_entry_id=drop) == 60
+    assert queue_engine.get_agent_backlog_minutes(a, t.id, DATE, exclude_entry_id=drop) == 60
 
 
 def test_backlog_QUIRK_an_entry_whose_service_vanished_contributes_nothing(frozen_now):
@@ -262,16 +262,16 @@ def test_backlog_QUIRK_an_entry_whose_service_vanished_contributes_nothing(froze
     """
     t = _tenant(); svc = _service(t.id, 60); a = _agent(t.id, [svc])
     _entry(t.id, svc, a)
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         s.delete(s.get(Service, svc)); s.commit()
-    assert main.get_agent_backlog_minutes(a, t.id, DATE) == 0
+    assert queue_engine.get_agent_backlog_minutes(a, t.id, DATE) == 0
 
 
 def test_backlog_truncates_rather_than_rounds(frozen_now):
     """90.5 minutes reads as 90."""
     t = _tenant(); svc = _service(t.id, 60); a = _agent(t.id, [svc])
     _entry(t.id, svc, a, estimated_start=at(10, 30) + timedelta(seconds=30))
-    assert main.get_agent_backlog_minutes(a, t.id, DATE) == 90
+    assert queue_engine.get_agent_backlog_minutes(a, t.id, DATE) == 90
 
 
 def test_batched_backlog_agrees_with_the_single_agent_version(frozen_now):
@@ -280,12 +280,12 @@ def test_batched_backlog_agrees_with_the_single_agent_version(frozen_now):
     _entry(t.id, svc, a, estimated_start=at(10, 30))
     _entry(t.id, svc, b, status="InService", estimated_start=at(9, 30))
 
-    assert main.get_agent_backlogs_minutes([a, b], t.id, DATE) == {a: 90, b: 30}
+    assert queue_engine.get_agent_backlogs_minutes([a, b], t.id, DATE) == {a: 90, b: 30}
 
 
 def test_batched_backlog_reports_zero_for_an_agent_with_no_entries(frozen_now):
     t = _tenant(); svc = _service(t.id, 60); a = _agent(t.id, [svc])
-    assert main.get_agent_backlogs_minutes([a], t.id, DATE) == {a: 0}
+    assert queue_engine.get_agent_backlogs_minutes([a], t.id, DATE) == {a: 0}
 
 
 # =============================================================================
@@ -296,7 +296,7 @@ def test_recalc_packs_waiting_entries_back_to_back_from_now(frozen_now):
     a = _agent(t.id, [svc, short])
     e1 = _entry(t.id, svc, a);  e2 = _entry(t.id, short, a);  e3 = _entry(t.id, svc, a)
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
 
     assert _read(e1).estimated_start == at(10, 0)
     assert _read(e2).estimated_start == at(11, 0)
@@ -304,10 +304,10 @@ def test_recalc_packs_waiting_entries_back_to_back_from_now(frozen_now):
 
 
 def test_recalc_before_opening_packs_from_opening_time(monkeypatch):
-    monkeypatch.setattr(main, "now", lambda: at(6, 0))
+    monkeypatch.setattr(core, "now", lambda: at(6, 0))
     t = _tenant(); svc = _service(t.id, 60); a = _agent(t.id, [svc])
     e1 = _entry(t.id, svc, a)
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
     assert _read(e1).estimated_start == at(8, 0)
 
 
@@ -317,7 +317,7 @@ def test_recalc_leaves_inservice_frozen_and_resumes_after_it(frozen_now):
     live = _entry(t.id, svc, a, status="InService", estimated_start=at(9, 30))
     nxt  = _entry(t.id, svc, a)
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
 
     assert _read(live).estimated_start == at(9, 30), "InService was re-timed"
     assert _read(nxt).estimated_start == at(10, 30)
@@ -333,7 +333,7 @@ def test_recalc_QUIRK_an_inservice_entry_with_no_eta_advances_nothing(frozen_now
     _entry(t.id, svc, a, status="InService", estimated_start=None)
     nxt = _entry(t.id, svc, a)
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
     assert _read(nxt).estimated_start == at(10, 0)
 
 
@@ -348,7 +348,7 @@ def test_recalc_honours_a_declared_arrival_and_leaves_the_gap_idle(frozen_now):
     e2 = _entry(t.id, full, a, earliest_arrival=at(14, 0))
     e3 = _entry(t.id, half, a)
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
 
     assert _read(e1).estimated_start == at(10, 0)
     assert _read(e2).estimated_start == at(14, 0)
@@ -360,7 +360,7 @@ def test_recalc_orders_by_joined_at_not_by_position(frozen_now):
     late  = _entry(t.id, svc, a, joined_at=at(9, 0), position=1)
     early = _entry(t.id, svc, a, joined_at=at(8, 0), position=2)
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
 
     assert _read(early).estimated_start == at(10, 0)
     assert _read(late).estimated_start == at(11, 0)
@@ -371,10 +371,10 @@ def test_recalc_falls_back_to_60_minutes_for_a_missing_service(frozen_now):
     t = _tenant(); svc = _service(t.id, 15); a = _agent(t.id, [svc])
     orphan = _entry(t.id, svc, a)
     after  = _entry(t.id, svc, a)
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         s.delete(s.get(Service, svc)); s.commit()
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
     assert _read(after).estimated_start == at(11, 0)
 
 
@@ -389,7 +389,7 @@ def test_recalc_renumbers_positions_across_every_agent_not_just_this_one(frozen_
     on_a = _entry(t.id, svc, a, earliest_arrival=at(14, 0))
     on_b = _entry(t.id, svc, b, estimated_start=at(10, 0), joined_at=at(9, 0))
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
 
     assert _read(on_b).position == 1, "other agent's entry was not renumbered"
     assert _read(on_a).position == 2
@@ -405,20 +405,20 @@ def test_recalc_QUIRK_leaves_stale_positions_on_terminal_entries(frozen_now):
     done = _entry(t.id, svc, a, status="Done", position=1)
     live = _entry(t.id, svc, a)
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
 
     assert _read(done).position == 1
     assert _read(live).position == 1, "both rows now claim position 1"
 
 
 def test_recalc_on_an_unknown_tenant_is_a_no_op(frozen_now):
-    main.recalculate_queue(99999, 1, DATE)   # must not raise
+    queue_engine.recalculate_queue(99999, 1, DATE)   # must not raise
 
 
 def test_recalc_ignores_other_dates(frozen_now):
     t = _tenant(); svc = _service(t.id, 60); a = _agent(t.id, [svc])
     tomorrow = _entry(t.id, svc, a, date="2026-06-21", estimated_start=at(15, 0))
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
     assert _read(tomorrow).estimated_start == at(15, 0)
 
 
@@ -427,7 +427,7 @@ def test_recalc_ignores_other_dates(frozen_now):
 # =============================================================================
 def test_gapfill_returns_none_for_an_empty_queue(frozen_now):
     t = _tenant(); svc = _service(t.id, 30); a = _agent(t.id, [svc])
-    assert main.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is None
+    assert queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is None
 
 
 def test_gapfill_QUIRK_ignores_waiting_entries_with_no_declared_arrival(frozen_now):
@@ -438,7 +438,7 @@ def test_gapfill_QUIRK_ignores_waiting_entries_with_no_declared_arrival(frozen_n
     t = _tenant(); svc = _service(t.id, 30); a = _agent(t.id, [svc])
     _entry(t.id, svc, a)
     _entry(t.id, svc, a)
-    assert main.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is None
+    assert queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is None
 
 
 def test_gapfill_slots_in_one_second_before_the_late_arrival(frozen_now):
@@ -446,7 +446,7 @@ def test_gapfill_slots_in_one_second_before_the_late_arrival(frozen_now):
     t = _tenant(); svc = _service(t.id, 30); a = _agent(t.id, [svc])
     later = _entry(t.id, svc, a, earliest_arrival=at(14, 0), joined_at=at(9, 0))
 
-    got = main.find_walkin_insert_joined_at(a, t.id, t, DATE, svc)
+    got = queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, svc)
     assert got == at(9, 0) - timedelta(seconds=1)
 
 
@@ -454,21 +454,21 @@ def test_gapfill_declines_when_the_walk_in_would_overrun(frozen_now):
     """Finishes 10:30, the booking is due 10:20 — one minute short is still no."""
     t = _tenant(); svc = _service(t.id, 30); a = _agent(t.id, [svc])
     _entry(t.id, svc, a, earliest_arrival=at(10, 20), joined_at=at(9, 0))
-    assert main.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is None
+    assert queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is None
 
 
 def test_gapfill_accepts_a_finish_exactly_on_the_arrival_time(frozen_now):
     """The comparison is <=, so back-to-back counts as fitting."""
     t = _tenant(); svc = _service(t.id, 30); a = _agent(t.id, [svc])
     _entry(t.id, svc, a, earliest_arrival=at(10, 30), joined_at=at(9, 0))
-    assert main.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is not None
+    assert queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is not None
 
 
 def test_gapfill_respects_the_new_entrys_own_declared_arrival(frozen_now):
     """Can't start before 13:50, so it runs to 14:20 and no longer fits."""
     t = _tenant(); svc = _service(t.id, 30); a = _agent(t.id, [svc])
     _entry(t.id, svc, a, earliest_arrival=at(14, 0), joined_at=at(9, 0))
-    assert main.find_walkin_insert_joined_at(
+    assert queue_engine.find_walkin_insert_joined_at(
         a, t.id, t, DATE, svc, new_arrival=at(13, 50)) is None
 
 
@@ -480,10 +480,10 @@ def test_gapfill_pushes_the_start_past_an_inservice_entry(frozen_now):
     _entry(t.id, svc, a, earliest_arrival=at(11, 0), joined_at=at(9, 0))
 
     # Walk-in starts 10:30, ends 11:00, exactly meets the 11:00 booking.
-    assert main.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is not None
+    assert queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is not None
     # A 45-minute service would run to 11:15 and miss it.
     long45 = _service(t.id, 45)
-    assert main.find_walkin_insert_joined_at(a, t.id, t, DATE, long45) is None
+    assert queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, long45) is None
 
 
 def test_gapfill_accumulates_the_queue_ahead_of_the_gap(frozen_now):
@@ -493,7 +493,7 @@ def test_gapfill_accumulates_the_queue_ahead_of_the_gap(frozen_now):
     _entry(t.id, svc, a, earliest_arrival=at(12, 0), joined_at=at(9, 0))
 
     # Walk-in starts 11:00 after two 30-min entries, finishes 11:30 <= 12:00.
-    assert main.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is not None
+    assert queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is not None
 
 
 def test_gapfill_takes_the_first_fitting_gap_not_the_best(frozen_now):
@@ -501,7 +501,7 @@ def test_gapfill_takes_the_first_fitting_gap_not_the_best(frozen_now):
     first  = _entry(t.id, svc, a, earliest_arrival=at(13, 0), joined_at=at(9, 0))
     second = _entry(t.id, svc, a, earliest_arrival=at(16, 0), joined_at=at(9, 30))
 
-    got = main.find_walkin_insert_joined_at(a, t.id, t, DATE, svc)
+    got = queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, svc)
     assert got == at(9, 0) - timedelta(seconds=1)
 
 
@@ -518,8 +518,8 @@ def test_gapfill_exclude_entry_id_skips_that_entry(frozen_now):
     blocker = _entry(t.id, svc, a, earliest_arrival=at(10, 20), joined_at=at(9, 0))
     behind  = _entry(t.id, svc, a, earliest_arrival=at(10, 45), joined_at=at(9, 30))
 
-    assert main.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is None
-    assert main.find_walkin_insert_joined_at(
+    assert queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is None
+    assert queue_engine.find_walkin_insert_joined_at(
         a, t.id, t, DATE, svc, exclude_entry_id=blocker
     ) == at(9, 30) - timedelta(seconds=1)
 
@@ -527,7 +527,7 @@ def test_gapfill_exclude_entry_id_skips_that_entry(frozen_now):
 def test_gapfill_returns_none_when_the_service_is_missing(frozen_now):
     t = _tenant(); svc = _service(t.id, 30); a = _agent(t.id, [svc])
     _entry(t.id, svc, a, earliest_arrival=at(14, 0), joined_at=at(9, 0))
-    assert main.find_walkin_insert_joined_at(a, t.id, t, DATE, 99999) is None
+    assert queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, 99999) is None
 
 
 def test_gapfill_QUIRK_ignores_closing_time(frozen_now):
@@ -541,7 +541,7 @@ def test_gapfill_QUIRK_ignores_closing_time(frozen_now):
     t = _tenant(opens=8, closes=17); svc = _service(t.id, 30)
     a = _agent(t.id, [svc])
     _entry(t.id, svc, a, earliest_arrival=at(22, 0), joined_at=at(9, 0))
-    assert main.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is not None
+    assert queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is not None
 
 
 # =============================================================================
@@ -555,18 +555,18 @@ def test_end_to_end_a_second_booking_lands_behind_the_first(frozen_now):
     """
     t = _tenant(); svc = _service(t.id, 60); a = _agent(t.id, [svc])
 
-    assert main.get_agent_backlog_minutes(a, t.id, DATE) == 0
-    first_eta = main.calculate_estimated_start(t, a, DATE, 0)
+    assert queue_engine.get_agent_backlog_minutes(a, t.id, DATE) == 0
+    first_eta = queue_engine.calculate_estimated_start(t, a, DATE, 0)
     assert first_eta == at(10, 0)
     first = _entry(t.id, svc, a, estimated_start=first_eta)
 
-    backlog = main.get_agent_backlog_minutes(a, t.id, DATE)
+    backlog = queue_engine.get_agent_backlog_minutes(a, t.id, DATE)
     assert backlog == 60
-    second_eta = main.calculate_estimated_start(t, a, DATE, backlog)
+    second_eta = queue_engine.calculate_estimated_start(t, a, DATE, backlog)
     assert second_eta == at(11, 0)
     second = _entry(t.id, svc, a, estimated_start=second_eta)
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
 
     assert _read(first).estimated_start == at(10, 0)
     assert _read(second).estimated_start == at(11, 0)

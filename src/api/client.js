@@ -81,6 +81,17 @@ export const api = {
   updateStatus:  (entryId, status) => request(`/admin/queue/${entryId}/status`, { method: 'PATCH', body: JSON.stringify({ status }) }),
   addWalkin:     (data)     => request('/admin/queue/walkin', { method: 'POST', body: JSON.stringify(data) }),
 
+  // Menu (ordering tenants) — prices are in cents everywhere
+  getMenu:        (tenantId) => request(`/admin/menu/${tenantId}`),
+  createMenuItem: (data)     => request('/admin/menu', { method: 'POST', body: JSON.stringify(data) }),
+  updateMenuItem: (id, data) => request(`/admin/menu/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteMenuItem: (id)       => request(`/admin/menu/${id}`, { method: 'DELETE' }),
+
+  // Orders — the kitchen board
+  getOrders:         (tenantId, date) => request(`/admin/orders/${tenantId}${date ? `?order_date=${date}` : ''}`),
+  updateOrderStatus: (orderId, status) => request(`/admin/orders/${orderId}/status`, { method: 'PATCH', body: JSON.stringify({ status }) }),
+  addCounterOrder:   (data)  => request('/admin/orders', { method: 'POST', body: JSON.stringify(data) }),
+
   // Users (super-admin only) — provision client logins
   getUsers:      ()         => request('/admin/users'),
   createUser:    (data)     => request('/admin/users', { method: 'POST', body: JSON.stringify(data) }),

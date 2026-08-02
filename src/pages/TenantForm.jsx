@@ -17,6 +17,9 @@ const EMPTY = {
   evolution_api_url:  '',
   evolution_api_key:  '',
   is_active:          true,
+  mode:                   'queue',
+  currency_symbol:        'R',
+  kitchen_parallel_items: 4,
 }
 
 function Field({ label, hint, error, children }) {
@@ -72,6 +75,23 @@ function NumberInput({ value, onChange, min, max }) {
   )
 }
 
+function SelectInput({ value, onChange, children }) {
+  return (
+    <select
+      value={value}
+      onChange={onChange}
+      style={{
+        background: '#ffffff', border: '1px solid #d1d5db',
+        borderRadius: 8, padding: '10px 14px', fontSize: 13,
+        color: 'var(--text)', outline: 'none', width: '100%', cursor: 'pointer',
+        fontFamily: 'var(--sans)', boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
+      }}
+    >
+      {children}
+    </select>
+  )
+}
+
 function SectionHeader({ label, sub }) {
   return (
     <div style={{ marginBottom: 16 }}>
@@ -94,6 +114,8 @@ export default function TenantForm({ tenants, reload }) {
   const [form, setForm]     = useState(EMPTY)
   const [errors, setErrors] = useState({})
   const [saving, setSaving] = useState(false)
+
+  const isOrders = form.mode === 'orders'
 
   useEffect(() => {
     if (isEdit) {
@@ -184,34 +206,77 @@ export default function TenantForm({ tenants, reload }) {
 
         <Divider />
 
-        {/* ── Labels ── */}
-        <SectionHeader label="Custom Labels" sub="Makes the bot speak the language of this business" />
+        {/* ── Bot mode ── */}
+        <SectionHeader label="What The Bot Does"
+          sub="Each business runs one conversation. Switching this changes what customers are offered on WhatsApp." />
         <div className="form-page-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-          <Field label="Agent Label" hint="Who serves the customer">
-            <TextInput value={form.agent_label} onChange={setText('agent_label')}
-              placeholder="Stylist / Doctor / Bay / Technician" />
-          </Field>
-          <Field label="Service Label" hint="What the customer is getting">
-            <TextInput value={form.service_label} onChange={setText('service_label')}
-              placeholder="Hair Service / Procedure / Job Type" />
+          <Field label="Mode">
+            <SelectInput value={form.mode} onChange={setText('mode')}>
+              <option value="queue">Queue bookings — salon, clinic, workshop</option>
+              <option value="orders">Takeaway orders — kitchen, kota shop</option>
+            </SelectInput>
           </Field>
         </div>
 
-        <Divider />
+        {isOrders ? (
+          <>
+            <Divider />
 
-        {/* ── Queue Config ── */}
-        <SectionHeader label="Queue Config" />
-        <div className="form-page-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16 }}>
-          <Field label="Opens (24h)" hint="e.g. 8 = 08:00">
-            <NumberInput value={form.queue_opens} onChange={setNum('queue_opens')} min={0} max={23} />
-          </Field>
-          <Field label="Closes (24h)" hint="e.g. 17 = 17:00" error={errors.queue_closes}>
-            <NumberInput value={form.queue_closes} onChange={setNum('queue_closes')} min={1} max={24} />
-          </Field>
-          <Field label="Advance Days" hint="0 = today only, 1 = today + tomorrow">
-            <NumberInput value={form.advance_days} onChange={setNum('advance_days')} min={0} max={14} />
-          </Field>
-        </div>
+            {/* ── Ordering Config ── */}
+            <SectionHeader label="Ordering Config" />
+            <div className="form-page-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16 }}>
+              <Field label="Opens (24h)" hint="e.g. 8 = 08:00">
+                <NumberInput value={form.queue_opens} onChange={setNum('queue_opens')} min={0} max={23} />
+              </Field>
+              <Field label="Closes (24h)" hint="e.g. 20 = 20:00" error={errors.queue_closes}>
+                <NumberInput value={form.queue_closes} onChange={setNum('queue_closes')} min={1} max={24} />
+              </Field>
+              <Field label="Currency" hint="Shown on the menu and totals">
+                <TextInput value={form.currency_symbol} onChange={setText('currency_symbol')}
+                  placeholder="R" />
+              </Field>
+            </div>
+            <div style={{ marginTop: 16, maxWidth: 260 }}>
+              <Field label="Items At Once"
+                hint="How many items the kitchen really cooks in parallel. Drives the ready-time quote.">
+                <NumberInput value={form.kitchen_parallel_items} onChange={setNum('kitchen_parallel_items')} min={1} max={50} />
+              </Field>
+            </div>
+          </>
+        ) : (
+          <>
+            <Divider />
+
+            {/* ── Labels ── */}
+            <SectionHeader label="Custom Labels" sub="Makes the bot speak the language of this business" />
+            <div className="form-page-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+              <Field label="Agent Label" hint="Who serves the customer">
+                <TextInput value={form.agent_label} onChange={setText('agent_label')}
+                  placeholder="Stylist / Doctor / Bay / Technician" />
+              </Field>
+              <Field label="Service Label" hint="What the customer is getting">
+                <TextInput value={form.service_label} onChange={setText('service_label')}
+                  placeholder="Hair Service / Procedure / Job Type" />
+              </Field>
+            </div>
+
+            <Divider />
+
+            {/* ── Queue Config ── */}
+            <SectionHeader label="Queue Config" />
+            <div className="form-page-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16 }}>
+              <Field label="Opens (24h)" hint="e.g. 8 = 08:00">
+                <NumberInput value={form.queue_opens} onChange={setNum('queue_opens')} min={0} max={23} />
+              </Field>
+              <Field label="Closes (24h)" hint="e.g. 17 = 17:00" error={errors.queue_closes}>
+                <NumberInput value={form.queue_closes} onChange={setNum('queue_closes')} min={1} max={24} />
+              </Field>
+              <Field label="Advance Days" hint="0 = today only, 1 = today + tomorrow">
+                <NumberInput value={form.advance_days} onChange={setNum('advance_days')} min={0} max={14} />
+              </Field>
+            </div>
+          </>
+        )}
 
         <Divider />
 

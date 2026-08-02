@@ -20,7 +20,8 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
 import main
-from main import Tenant, Service, Agent, AgentService, QueueEntry
+from app import core, db, jobs, queue_engine
+from app.models import Tenant, Service, Agent, AgentService, QueueEntry
 
 
 DATE = "2026-06-20"
@@ -37,7 +38,7 @@ def hdr(super_token):
 
 
 def _seed(n_services=1):
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         t = Tenant(business_name="Report Co", whatsapp_number="27810000000",
                    evolution_instance="i", evolution_api_key="k",
                    evolution_api_url="http://x", queue_opens=8, queue_closes=17)
@@ -68,7 +69,7 @@ def _entry(tenant_id, svc, agent, *, status="Done", closed_by="staff",
            date=DATE, via="whatsapp", joined_at=None, started_at=None,
            finished_at=None):
     _seq[0] += 1
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         e = QueueEntry(
             tenant_id=tenant_id, service_id=svc, agent_id=agent,
             customer_number=f"2781{_seq[0]}", customer_name=f"C{_seq[0]}",
@@ -342,7 +343,7 @@ def test_breakdown_by_service_totals_scheduled_minutes(client, hdr):
 def test_breakdowns_survive_a_deleted_agent_or_service(client, hdr):
     tid, [svc], a = _seed()
     _entry(tid, svc, a)
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         s.delete(s.get(Agent, a)); s.delete(s.get(Service, svc)); s.commit()
 
     body = _get(client, hdr, tid, from_date=DATE, to_date=DATE)
@@ -362,7 +363,7 @@ def test_channel_split(client, hdr):
 
 def test_agent_rows_are_ranked_by_volume(client, hdr):
     tid, [svc], a = _seed()
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         b = Agent(tenant_id=tid, name="Thabo")
         s.add(b); s.commit(); s.refresh(b)
         bid = b.id
@@ -382,7 +383,7 @@ def test_default_range_is_the_last_30_days(client, hdr):
     tid, _, _ = _seed()
     body = _get(client, hdr, tid)
     assert body["days"] == 30
-    assert body["to_date"] == main.today_str()
+    assert body["to_date"] == core.today_str()
 
 
 def test_other_tenants_entries_are_never_counted(client, hdr):
@@ -468,7 +469,7 @@ def test_marking_done_records_staff_and_a_finish_time(client, hdr):
 
     assert client.patch(f"/admin/queue/{eid}/status", headers=hdr,
                         json={"status": "Done"}).status_code == 200
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         e = s.get(QueueEntry, eid)
     assert e.closed_by == "staff" and e.finished_at is not None
 
@@ -478,13 +479,13 @@ def test_going_into_service_records_a_start_time(client, hdr):
     eid = _entry(tid, svc, a, status="Waiting", closed_by="")
 
     client.patch(f"/admin/queue/{eid}/status", headers=hdr, json={"status": "InService"})
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         first = s.get(QueueEntry, eid).started_at
     assert first is not None
 
     # Re-entering service (staff mis-click, then back) must not reset the clock.
     client.patch(f"/admin/queue/{eid}/status", headers=hdr, json={"status": "InService"})
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         assert s.get(QueueEntry, eid).started_at == first
 
 
@@ -493,11 +494,11 @@ async def test_the_midnight_sweep_tags_its_own_closes_as_system():
     """The trap, closed at the source."""
     tid, [svc], a = _seed()
     eid = _entry(tid, svc, a, status="Waiting", closed_by="",
-                 date=main.yesterday_str())
+                 date=core.yesterday_str())
 
-    await main.midnight_reset_job()
+    await jobs.midnight_reset_job()
 
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         e = s.get(QueueEntry, eid)
     assert e.status == "NoShow"
     assert e.closed_by == "system", "would have been read as a real no-show"
@@ -508,8 +509,8 @@ def test_a_whatsapp_cancellation_is_tagged_to_the_customer():
     tid, [svc], a = _seed()
     eid = _entry(tid, svc, a, status="Waiting", closed_by="")
 
-    main.cancel_party(tid, eid)
+    queue_engine.cancel_party(tid, eid)
 
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         e = s.get(QueueEntry, eid)
     assert e.status == "Cancelled" and e.closed_by == "customer"

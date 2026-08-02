@@ -163,6 +163,14 @@ input, select, textarea { font-family: var(--sans); }
   margin-bottom: 28px;
 }
 
+/* The kitchen board carries a fourth figure — takings — alongside the counts. */
+.stats-grid-4 {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  margin-bottom: 28px;
+}
+
 /* ── Table wrapper (horizontal scroll on small screens) ─────────────────── */
 .table-wrap {
   overflow-x: auto;
@@ -212,7 +220,8 @@ input, select, textarea { font-family: var(--sans); }
     padding: 24px 22px;
   }
 
-  .stats-grid {
+  .stats-grid,
+  .stats-grid-4 {
     gap: 12px;
   }
 
@@ -272,6 +281,13 @@ input, select, textarea { font-family: var(--sans); }
 
   /* Stats: keep 3 columns but tighter */
   .stats-grid {
+    gap: 10px;
+    margin-bottom: 18px;
+  }
+
+  /* Four across is unreadable on a phone — two rows of two instead. */
+  .stats-grid-4 {
+    grid-template-columns: repeat(2, 1fr);
     gap: 10px;
     margin-bottom: 18px;
   }
@@ -360,7 +376,8 @@ input, select, textarea { font-family: var(--sans); }
    VERY SMALL  ≤ 400px
 ═══════════════════════════════════════════════════════════════════════════ */
 @media (max-width: 400px) {
-  .stats-grid {
+  .stats-grid,
+  .stats-grid-4 {
     grid-template-columns: 1fr;
   }
 }
