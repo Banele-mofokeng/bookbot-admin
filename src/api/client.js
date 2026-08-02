@@ -61,6 +61,21 @@ export const api = {
   createAgent:   (data)     => request('/admin/agents', { method: 'POST', body: JSON.stringify(data) }),
   updateAgent:   (id, data) => request(`/admin/agents/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
 
+  // Agent working hours — recurring weekly windows, plus one-off blocks that
+  // override them. An agent with no windows falls back to the tenant's hours.
+  getSchedule:   (agentId)  => request(`/admin/agents/${agentId}/schedule`),
+  setSchedule:   (agentId, windows) => request(`/admin/agents/${agentId}/schedule`, { method: 'PUT', body: JSON.stringify({ windows }) }),
+  getBlocks:     (agentId, fromDate) => request(`/admin/agents/${agentId}/blocks${fromDate ? `?from_date=${fromDate}` : ''}`),
+  createBlock:   (agentId, data) => request(`/admin/agents/${agentId}/blocks`, { method: 'POST', body: JSON.stringify(data) }),
+  deleteBlock:   (blockId)  => request(`/admin/blocks/${blockId}`, { method: 'DELETE' }),
+  getWindows:    (agentId, date) => request(`/admin/agents/${agentId}/windows${date ? `?queue_date=${date}` : ''}`),
+
+  // Reports
+  getAnalytics:  (tenantId, fromDate, toDate) => request(
+    `/admin/analytics/${tenantId}` + (fromDate || toDate
+      ? `?${[fromDate && `from_date=${fromDate}`, toDate && `to_date=${toDate}`].filter(Boolean).join('&')}`
+      : '')),
+
   // Queue
   getQueue:      (tenantId, date) => request(`/admin/queue/${tenantId}${date ? `?queue_date=${date}` : ''}`),
   updateStatus:  (entryId, status) => request(`/admin/queue/${entryId}/status`, { method: 'PATCH', body: JSON.stringify({ status }) }),

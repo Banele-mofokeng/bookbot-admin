@@ -1,11 +1,15 @@
 import os
+import asyncio
 import json
+import math
 import hashlib
 import hmac
 import secrets
-import requests
+import time as _time          # aliased — "time" is taken by datetime.time below
+import httpx
 import redis
 import jwt
+from contextlib import contextmanager
 from datetime import datetime, timedelta, time, date
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, HTTPException, Header, Depends, APIRouter
@@ -55,6 +59,25 @@ engine       = create_engine(DATABASE_URL)
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 SESSION_TTL  = 60 * 30  # 30 min inactivity expires session
 
+# ── Outbound message delivery ────────────────────────────────────────────────
+# Every WhatsApp message goes through the outbox table rather than a direct
+# blocking HTTP call, so a webhook reply never waits on Evolution and a failed
+# send is retried instead of lost.
+OUTBOX_POLL_SECONDS  = 0.5   # drain tick — also the worst-case added reply latency
+OUTBOX_BATCH         = 20    # messages per tick
+OUTBOX_MAX_ATTEMPTS  = 5     # then give up and mark Failed
+OUTBOX_SEND_TIMEOUT  = 10.0  # seconds per Evolution call
+# How often to re-derive notifications that should have fired from queue state.
+RECONCILE_SECONDS    = 60
+
+# ── Booking lock ─────────────────────────────────────────────────────────────
+# Agent assignment reads the queue, then writes to it. Two bookings landing
+# between the read and the write both pick the same "shortest backlog" agent.
+# A Redis lock scoped per tenant per day serialises that window.
+BOOKING_LOCK_TTL   = 15    # seconds — safety net if a holder dies mid-booking
+BOOKING_LOCK_WAIT  = 2.0   # max seconds to wait before proceeding unlocked
+BOOKING_LOCK_RETRY = 0.02  # seconds between acquire attempts
+
 # Allowed CORS origins — comma-separated env, defaults to "*" for local/dev.
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 
@@ -66,6 +89,14 @@ JWT_EXP_HOURS  = int(os.getenv("JWT_EXP_HOURS", "12"))
 # Super-admin (platform operator) seeded on startup if absent.
 SUPERADMIN_EMAIL    = os.getenv("SUPERADMIN_EMAIL", "")
 SUPERADMIN_PASSWORD = os.getenv("SUPERADMIN_PASSWORD", "")
+
+# ── Webhook config ───────────────────────────────────────────────────────────
+# Shared secret Evolution must present on every /webhook call. Without it the
+# endpoint is world-writable: the tenant is resolved from the request body, and
+# a business WhatsApp number is public, so anyone could forge or cancel
+# bookings. Comma-separated so a secret can be rotated with no downtime — set
+# "old,new", repoint Evolution at "new", then drop "old".
+WEBHOOK_SECRETS = [s.strip() for s in os.getenv("WEBHOOK_SECRET", "").split(",") if s.strip()]
 
 
 # =============================================================================
@@ -128,6 +159,45 @@ class AgentService(SQLModel, table=True):
     service_id: int            = Field(foreign_key="service.id")
 
 
+class AgentSchedule(SQLModel, table=True):
+    """
+    One recurring working window for an agent on one weekday. Several rows for
+    the same weekday make a split shift — 08:00–12:00 and 13:00–17:00 is two
+    rows, and the hour between them is simply not worked.
+
+    Times are minutes from midnight rather than a time column: it keeps the
+    arithmetic in one unit, sidesteps per-dialect time handling, and lets a
+    window run to 1440 (midnight) without wrapping.
+
+    An agent with NO rows at all falls back to the tenant's opening hours, so
+    every existing agent keeps working exactly as before until someone sets a
+    schedule. An agent WITH rows but none for today is off today.
+    """
+    __tablename__ = "agent_schedule"
+    id: Optional[int]          = Field(default=None, primary_key=True)
+    tenant_id: int             = Field(foreign_key="tenant.id")
+    agent_id: int              = Field(foreign_key="agent.id")
+    weekday: int                                     # 0 = Monday … 6 = Sunday
+    start_minute: int          = 8 * 60              # 480 = 08:00
+    end_minute: int            = 17 * 60             # 1020 = 17:00, exclusive
+
+
+class AgentBlock(SQLModel, table=True):
+    """
+    A one-off window an agent is unavailable — leave, training, a dentist
+    appointment. Subtracted from whatever AgentSchedule says, so it wins.
+    Stored as absolute datetimes because a block is a specific occasion, not a
+    recurring pattern.
+    """
+    __tablename__ = "agent_block"
+    id: Optional[int]          = Field(default=None, primary_key=True)
+    tenant_id: int             = Field(foreign_key="tenant.id")
+    agent_id: int              = Field(foreign_key="agent.id")
+    starts_at: datetime
+    ends_at: datetime
+    reason: str                = ""
+
+
 class QueueEntry(SQLModel, table=True):
     """A single customer in a queue."""
     id: Optional[int]          = Field(default=None, primary_key=True)
@@ -149,27 +219,129 @@ class QueueEntry(SQLModel, table=True):
     notified_two_away: bool    = False
     notified_next: bool        = False
     joined_at: datetime        = Field(default_factory=now)
+    # ── Provenance, for reporting ──
+    # Who closed this entry: "staff" (someone tapped it on the dashboard),
+    # "customer" (cancelled over WhatsApp), "system" (the midnight sweep closed
+    # it because nobody ever did), or "" on rows written before this existed.
+    # Reporting must never merge these. A system-closed NoShow means the shop
+    # forgot to tap Done — not that the customer failed to turn up — and
+    # counting it as a no-show measures staff habits while claiming to measure
+    # customers.
+    closed_by: str             = ""
+    started_at: Optional[datetime]  = None   # first moved to InService
+    finished_at: Optional[datetime] = None   # reached a terminal status
+
+
+class OutboxMessage(SQLModel, table=True):
+    """
+    A WhatsApp message waiting to go out. Writing here instead of calling
+    Evolution inline means a webhook reply never blocks on the network, and a
+    send that fails is retried rather than silently dropped.
+    """
+    __tablename__ = "outbox_message"
+    id: Optional[int]          = Field(default=None, primary_key=True)
+    tenant_id: int             = Field(foreign_key="tenant.id")
+    to_number: str
+    body: str
+    # Set for notifications that must never go out twice (e.g. "you're next"
+    # for a given entry). Empty for ordinary conversational replies, which are
+    # always sent — the same menu text legitimately repeats.
+    dedupe_key: str            = Field(default="", index=True)
+    status: str                = "Pending"   # Pending | Sent | Failed
+    attempts: int              = 0
+    # Indexed jointly with status — see INDEXES; alone it serves no query.
+    next_attempt_at: datetime  = Field(default_factory=now)
+    last_error: str            = ""
+    created_at: datetime       = Field(default_factory=now)
+    sent_at: Optional[datetime] = None
+
+
+# Indexes for the queries that actually run hot. Table names come from the
+# models so a rename can't leave a stale string behind.
+#
+# Every lookup in the queue engine — backlog, ETA recalculation, gap-fill,
+# next-waiter — filters the same four columns, so one composite index serves all
+# of them, and its (tenant_id, queue_date) prefix also serves the dashboard's
+# whole-day read.
+INDEXES = [
+    # name, table, columns
+    ("ix_queueentry_tenant_date_agent_status", QueueEntry.__tablename__,
+     "tenant_id, queue_date, agent_id, status"),
+    # "Are you already in the queue?" — runs on every WhatsApp booking attempt.
+    ("ix_queueentry_tenant_customer_date", QueueEntry.__tablename__,
+     "tenant_id, customer_number, queue_date"),
+    # Whole-party cancellation walks children back to their parent.
+    ("ix_queueentry_parent", QueueEntry.__tablename__, "parent_entry_id"),
+    # Cross-tenant sweeps: the 60s reconciler and the midnight reset.
+    ("ix_queueentry_status_date", QueueEntry.__tablename__, "status, queue_date"),
+    # The outbox drain runs twice a second — this is the hottest query here.
+    ("ix_outbox_status_due", OutboxMessage.__tablename__, "status, next_attempt_at"),
+    ("ix_service_tenant", Service.__tablename__, "tenant_id"),
+    ("ix_agent_tenant", Agent.__tablename__, "tenant_id"),
+    ("ix_agentservice_service", AgentService.__tablename__, "service_id"),
+    ("ix_agentservice_agent", AgentService.__tablename__, "agent_id"),
+    # Working windows are resolved for every candidate agent on every booking.
+    ("ix_agentschedule_agent_weekday", AgentSchedule.__tablename__,
+     "agent_id, weekday"),
+    ("ix_agentblock_agent_starts", AgentBlock.__tablename__,
+     "agent_id, starts_at"),
+    # Every inbound webhook resolves the tenant by its WhatsApp number.
+    ("ix_tenant_whatsapp", Tenant.__tablename__, "whatsapp_number"),
+]
+
+
+def ensure_indexes():
+    """
+    Create the hot-path indexes if they're missing.
+
+    create_all() only builds indexes for tables it creates, so an existing
+    deployment never gets them from the model definitions alone. CREATE INDEX
+    IF NOT EXISTS is understood by both PostgreSQL and SQLite, so this is the
+    one place indexes are declared for fresh and existing databases alike.
+
+    These are small tables; the brief write lock PostgreSQL takes while building
+    is not worth the extra machinery of CONCURRENTLY. Revisit if queueentry ever
+    grows to millions of rows.
+    """
+    from sqlalchemy import text as sql_text
+    with engine.connect() as conn:
+        for name, table, columns in INDEXES:
+            conn.execute(sql_text(
+                f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})"
+            ))
+        conn.commit()
+
+
+# Columns added to queueentry after the table first shipped. create_all() never
+# alters an existing table, so an already-deployed database only gets these from
+# here. Order is irrelevant — each is added only if absent.
+QUEUEENTRY_COLUMNS = [
+    ("parent_entry_id",  "INTEGER"),
+    ("earliest_arrival", "TIMESTAMP"),
+    # Analytics provenance. Existing rows keep closed_by = '' and are reported
+    # as "unknown" rather than being folded into a real no-show count.
+    ("closed_by",        "VARCHAR DEFAULT ''"),
+    ("started_at",       "TIMESTAMP"),
+    ("finished_at",      "TIMESTAMP"),
+]
 
 
 def create_db_and_tables():
+    from sqlalchemy import text as sql_text
     SQLModel.metadata.create_all(engine)
+    ensure_indexes()
     # Add new columns to existing tables if they don't exist yet (PostgreSQL migration)
     with engine.connect() as conn:
-        result = conn.execute(__import__("sqlalchemy").text(
+        existing = {row[0] for row in conn.execute(sql_text(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_name = 'queueentry'"
-        ))
-        existing = [row[0] for row in result.fetchall()]
-        if "parent_entry_id" not in existing:
-            conn.execute(__import__("sqlalchemy").text(
-                "ALTER TABLE queueentry ADD COLUMN parent_entry_id INTEGER"
-            ))
-            conn.commit()
-        if "earliest_arrival" not in existing:
-            conn.execute(__import__("sqlalchemy").text(
-                "ALTER TABLE queueentry ADD COLUMN earliest_arrival TIMESTAMP"
-            ))
-            conn.commit()
+        )).fetchall()}
+        for column, coltype in QUEUEENTRY_COLUMNS:
+            if column not in existing:
+                conn.execute(sql_text(
+                    f"ALTER TABLE queueentry ADD COLUMN {column} {coltype}"
+                ))
+                conn.commit()
 
 
 # =============================================================================
@@ -236,6 +408,43 @@ def ensure_tenant_access(user: "User", tenant_id: int):
         raise HTTPException(status_code=403, detail="Forbidden — not your business")
 
 
+def verify_webhook_secret(
+    request: Request,
+    x_webhook_token: str = Header(default=""),
+    authorization: str = Header(default=""),
+):
+    """
+    Authenticate an inbound Evolution webhook call against WEBHOOK_SECRETS.
+
+    The secret may arrive three ways, because Evolution deployments differ in
+    what they can be configured to send:
+      - 'X-Webhook-Token: <secret>'
+      - 'Authorization: Bearer <secret>'
+      - '?token=<secret>' on the webhook URL (always available — the URL itself
+        is editable in the Evolution instance settings)
+
+    With WEBHOOK_SECRET unset the check is skipped, so an already-deployed bot
+    keeps taking bookings across the upgrade instead of going silent. Startup
+    logs a warning in that case and /health reports it as off.
+    """
+    if not WEBHOOK_SECRETS:
+        return
+    if x_webhook_token.strip():
+        presented = x_webhook_token.strip()
+    elif authorization.lower().startswith("bearer "):
+        presented = authorization.split(" ", 1)[1].strip()
+    else:
+        presented = (request.query_params.get("token") or "").strip()
+    # Compare against every configured secret so rotation works, in constant
+    # time so a wrong guess can't be tuned byte by byte.
+    matched = False
+    for secret in WEBHOOK_SECRETS:
+        if hmac.compare_digest(presented.encode(), secret.encode()):
+            matched = True
+    if not presented or not matched:
+        raise HTTPException(status_code=401, detail="Invalid webhook credentials")
+
+
 def seed_superadmin():
     """Create the platform operator login from env if it doesn't exist yet."""
     if not (SUPERADMIN_EMAIL and SUPERADMIN_PASSWORD):
@@ -275,14 +484,33 @@ async def on_startup():
     print("🚀 QueueBot starting...")
     create_db_and_tables()
     seed_superadmin()
+    if not WEBHOOK_SECRETS:
+        print("⚠️  WEBHOOK_SECRET not set — /webhook is UNAUTHENTICATED. "
+              "Anyone who knows this URL can forge or cancel bookings. Set it now.")
+    else:
+        print(f"✅ /webhook authenticated ({len(WEBHOOK_SECRETS)} secret(s) accepted)")
     scheduler.add_job(midnight_reset_job, "cron", hour=0, minute=1, id="midnight_reset")
+    scheduler.add_job(reconcile_notifications, "interval",
+                      seconds=RECONCILE_SECONDS, id="reconcile_notifications")
     scheduler.start()
+    # Catch up on anything missed while the process was down: the 00:01 cron
+    # doesn't fire retroactively, so a restart spanning midnight would otherwise
+    # leave yesterday's queue open forever.
+    await midnight_reset_job()
+    app.state.outbox_task = asyncio.create_task(outbox_worker())
     print("✅ DB ready. Scheduler running.")
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
     scheduler.shutdown()
+    task = getattr(app.state, "outbox_task", None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 # =============================================================================
@@ -314,9 +542,290 @@ def clear_session(tenant_id: int, customer_num: str):
     redis_client.delete(f"s:{tenant_id}:{customer_num}")
 
 
+_RELEASE_LOCK_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+"""
+
+
+@contextmanager
+def booking_lock(tenant_id: int, queue_date: str):
+    """
+    Serialise agent assignment + queue insert for one tenant on one day.
+
+    Assignment is read-then-write: assign_agent measures every agent's backlog,
+    then the caller inserts a row that changes those backlogs. Two bookings
+    landing inside that window both see the pre-insert state, both pick the
+    same shortest-backlog agent, and both compute the same position. Positions
+    self-heal on the next recalculate_queue; the agent choice does not.
+
+    Scoped per tenant per date, so two businesses — or the same business on two
+    different dates — never wait on each other.
+
+    Degrades open. If Redis is unreachable, or the lock is still held after
+    BOOKING_LOCK_WAIT, the booking goes ahead unlocked. That is exactly the
+    behaviour before this lock existed, and dropping a real booking is worse
+    than a rare double-assignment that staff can see and fix on the dashboard.
+
+    The wait is capped short because handle_webhook is async and calls into
+    this synchronously — a long spin here stalls the event loop, and with it
+    the outbox drain. Normal hold time is a few writes, tens of milliseconds.
+
+    Yields True if the lock was actually held, False if it degraded open.
+    """
+    key   = f"lock:booking:{tenant_id}:{queue_date}"
+    token = secrets.token_hex(16)
+    held  = False
+    try:
+        deadline = _time.monotonic() + BOOKING_LOCK_WAIT
+        while True:
+            if redis_client.set(key, token, nx=True, ex=BOOKING_LOCK_TTL):
+                held = True
+                break
+            if _time.monotonic() >= deadline:
+                print(f"⚠️  booking lock busy | {key} — proceeding unlocked")
+                break
+            _time.sleep(BOOKING_LOCK_RETRY)
+    except Exception as exc:
+        print(f"⚠️  booking lock unavailable ({exc}) — proceeding unlocked")
+
+    try:
+        yield held
+    finally:
+        if held:
+            try:
+                # Compare-and-delete. If our TTL already expired and another
+                # booking took the lock, a blind DEL would release theirs.
+                redis_client.eval(_RELEASE_LOCK_LUA, 1, key, token)
+            except Exception as exc:
+                print(f"⚠️  booking lock release failed ({exc}) — "
+                      f"expires on its own within {BOOKING_LOCK_TTL}s")
+
+
 # =============================================================================
 # 6. QUEUE ENGINE
 # =============================================================================
+
+# ── Working windows ──────────────────────────────────────────────────────────
+# A "window" is a (start, end) pair of naive datetimes on one calendar day
+# during which one agent is actually available. Everything downstream — ETAs,
+# backlog placement, gap-fill — schedules inside windows instead of assuming
+# the agent is free from opening to closing.
+
+Window = "tuple"   # (datetime, datetime); aliased for readability only
+
+
+def _merge_windows(windows: List) -> List:
+    """Sort and coalesce touching or overlapping windows."""
+    out: List = []
+    for start, end in sorted(windows):
+        if end <= start:
+            continue
+        if out and start <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], end))
+        else:
+            out.append((start, end))
+    return out
+
+
+def _subtract_windows(windows: List, blocks: List) -> List:
+    """
+    Remove every blocked interval from every window. A block in the middle of a
+    shift splits it in two, which is what makes a lunch break work.
+    """
+    out = list(windows)
+    for b_start, b_end in blocks:
+        if b_end <= b_start:
+            continue
+        nxt: List = []
+        for w_start, w_end in out:
+            if b_end <= w_start or b_start >= w_end:
+                nxt.append((w_start, w_end))       # no overlap
+                continue
+            if b_start > w_start:
+                nxt.append((w_start, b_start))     # keep the head
+            if b_end < w_end:
+                nxt.append((b_end, w_end))         # keep the tail
+        out = nxt
+    return [(s, e) for s, e in sorted(out) if e > s]
+
+
+def get_working_windows_for(agent_ids: List[int], tenant: Tenant,
+                            queue_date: str) -> Dict[int, List]:
+    """
+    Working windows for several agents on one date — three queries total, so
+    assign_agent can rank every candidate without a per-agent round trip.
+
+    Fallback rules, in order:
+      * agent has schedule rows for this weekday  → those windows
+      * agent has no schedule rows at all         → the tenant's opening hours
+      * agent has rows, but none for this weekday → [] (off today)
+
+    The middle case is what keeps existing deployments unchanged: nobody has a
+    schedule yet, so nobody's hours move until someone sets one.
+    """
+    if not agent_ids:
+        return {}
+
+    day = datetime.strptime(queue_date, "%Y-%m-%d")
+    weekday = day.weekday()
+    day_end = day + timedelta(days=1)
+
+    with Session(engine) as s:
+        rows = s.exec(
+            select(AgentSchedule).where(AgentSchedule.agent_id.in_(agent_ids))
+        ).all()
+        blocks = s.exec(
+            select(AgentBlock).where(
+                AgentBlock.agent_id.in_(agent_ids),
+                AgentBlock.starts_at < day_end,
+                AgentBlock.ends_at   > day,
+            )
+        ).all()
+
+    has_schedule   = {r.agent_id for r in rows}
+    todays_windows: Dict[int, List] = {}
+    for r in rows:
+        if r.weekday != weekday:
+            continue
+        todays_windows.setdefault(r.agent_id, []).append((
+            day + timedelta(minutes=r.start_minute),
+            day + timedelta(minutes=r.end_minute),
+        ))
+
+    blocks_by_agent: Dict[int, List] = {}
+    for b in blocks:
+        # Clip to the day — a block running overnight only removes today's part.
+        blocks_by_agent.setdefault(b.agent_id, []).append(
+            (max(b.starts_at, day), min(b.ends_at, day_end))
+        )
+
+    tenant_hours = [(
+        day + timedelta(hours=tenant.queue_opens),
+        day + timedelta(hours=tenant.queue_closes),
+    )]
+
+    result: Dict[int, List] = {}
+    for aid in agent_ids:
+        if aid in has_schedule:
+            base = todays_windows.get(aid, [])
+        else:
+            base = tenant_hours
+        result[aid] = _subtract_windows(_merge_windows(base),
+                                        blocks_by_agent.get(aid, []))
+    return result
+
+
+def get_working_windows(tenant: Tenant, agent_id: int, queue_date: str) -> List:
+    """Single-agent convenience wrapper. See get_working_windows_for."""
+    return get_working_windows_for([agent_id], tenant, queue_date).get(agent_id, [])
+
+
+def place_in_windows(windows: List, floor: datetime,
+                     duration_minutes: int) -> Optional[datetime]:
+    """
+    Earliest start at or after `floor` where `duration_minutes` fits inside one
+    contiguous window. Returns None when the day has no room left.
+
+    A service must fit in a single window: a 60-minute cut cannot start at
+    12:30 if lunch begins at 13:00, because nobody actually works through it.
+
+    `start < w_end` only bites for a zero duration, where it stops a bare
+    "when is this agent next free?" snap from answering 13:00 on the dot — the
+    exact minute the agent leaves for lunch.
+    """
+    need = timedelta(minutes=duration_minutes)
+    for w_start, w_end in windows:
+        start = max(w_start, floor)
+        if start < w_end and start + need <= w_end:
+            return start
+    return None
+
+
+def _service_map(s: Session, entries) -> Dict[int, Service]:
+    """
+    Every service referenced by these entries, in one query.
+
+    The queue engine walks entries and needs each one's duration. Doing that
+    with s.get(Service, ...) per entry costs a round trip per row, on the
+    hottest paths in the app (backlog, ETA recalc, gap-fill, dashboard read).
+    A day's queue only ever touches a handful of distinct services.
+    """
+    ids = {e.service_id for e in entries if e.service_id is not None}
+    if not ids:
+        return {}
+    return {
+        svc.id: svc
+        for svc in s.exec(select(Service).where(Service.id.in_(ids))).all()
+    }
+
+
+def _backlog_from_entries(entries, services: Dict[int, Service],
+                          current_time: datetime,
+                          exclude_entry_id: Optional[int] = None) -> int:
+    """
+    Backlog in minutes for one already-fetched list of entries. Pure — no
+    queries — so callers that need several agents' backlogs can fetch once
+    and call this per agent.
+    """
+    total = 0
+    for e in entries:
+        if exclude_entry_id and e.id == exclude_entry_id:
+            continue
+        svc = services.get(e.service_id)
+        if not svc:
+            continue
+        if e.estimated_start:
+            # Use actual scheduled finish time so gaps (e.g. earliest_arrival)
+            # are reflected — the agent isn't free until this entry is done.
+            finish_time = e.estimated_start + timedelta(minutes=svc.duration_minutes)
+            remaining = (finish_time - current_time).total_seconds() / 60
+            if e.status == "InService":
+                total += max(0, remaining)
+            else:
+                # Waiting: never less than the full service duration
+                total += max(svc.duration_minutes, max(0, remaining))
+        else:
+            total += svc.duration_minutes
+    return int(total)
+
+
+def get_agent_backlogs_minutes(agent_ids: List[int], tenant_id: int,
+                               queue_date: str) -> Dict[int, int]:
+    """
+    Backlog for several agents at once — two queries total, regardless of how
+    many agents or entries are involved.
+
+    assign_agent used to call get_agent_backlog_minutes once per candidate
+    agent, each opening its own Session and re-querying services per entry.
+    For a salon with 5 stylists and 20 people booked that was over 100 queries
+    to answer one "who's free soonest?".
+    """
+    if not agent_ids:
+        return {}
+    with Session(engine) as s:
+        entries = s.exec(
+            select(QueueEntry).where(
+                QueueEntry.agent_id.in_(agent_ids),
+                QueueEntry.tenant_id  == tenant_id,
+                QueueEntry.queue_date == queue_date,
+                QueueEntry.status.in_(["Waiting", "InService"])
+            ).order_by(QueueEntry.joined_at)
+        ).all()
+        services = _service_map(s, entries)
+
+        current_time = now()
+        by_agent: Dict[int, list] = {aid: [] for aid in agent_ids}
+        for e in entries:
+            by_agent.setdefault(e.agent_id, []).append(e)
+        return {
+            aid: _backlog_from_entries(by_agent.get(aid, []), services, current_time)
+            for aid in agent_ids
+        }
+
 
 def get_agent_backlog_minutes(agent_id: int, tenant_id: int, queue_date: str,
                                exclude_entry_id: Optional[int] = None) -> int:
@@ -337,28 +846,8 @@ def get_agent_backlog_minutes(agent_id: int, tenant_id: int, queue_date: str,
                 QueueEntry.status.in_(["Waiting", "InService"])
             ).order_by(QueueEntry.joined_at)
         ).all()
-
-        current_time = now()
-        total = 0
-        for e in entries:
-            if exclude_entry_id and e.id == exclude_entry_id:
-                continue
-            svc = s.get(Service, e.service_id)
-            if not svc:
-                continue
-            if e.estimated_start:
-                # Use actual scheduled finish time so gaps (e.g. earliest_arrival)
-                # are reflected — the agent isn't free until this entry is done.
-                finish_time = e.estimated_start + timedelta(minutes=svc.duration_minutes)
-                remaining = (finish_time - current_time).total_seconds() / 60
-                if e.status == "InService":
-                    total += max(0, remaining)
-                else:
-                    # Waiting: never less than the full service duration
-                    total += max(svc.duration_minutes, max(0, remaining))
-            else:
-                total += svc.duration_minutes
-    return int(total)
+        services = _service_map(s, entries)
+        return _backlog_from_entries(entries, services, now(), exclude_entry_id)
 
 
 def calculate_estimated_start(tenant: Tenant, agent_id: int,
@@ -367,6 +856,11 @@ def calculate_estimated_start(tenant: Tenant, agent_id: int,
     """Convert backlog minutes into an actual datetime.
     Uses max(queue_opens, now) as the base so backlog is always added to
     the correct anchor — preventing stale opens-time calculations mid-day.
+
+    The result is then snapped forward into the agent's next working window, so
+    a quote never lands in a lunch break or on a day off. If it lands past the
+    agent's last window the raw time is returned unchanged: the day is over-
+    subscribed, and an honest after-hours ETA beats pretending otherwise.
     """
     opens = datetime.strptime(
         f"{queue_date} {tenant.queue_opens:02d}:00", "%Y-%m-%d %H:%M"
@@ -376,7 +870,10 @@ def calculate_estimated_start(tenant: Tenant, agent_id: int,
     # Respect customer's declared arrival time
     if earliest_arrival:
         result = max(result, earliest_arrival)
-    return result
+
+    windows = get_working_windows(tenant, agent_id, queue_date)
+    snapped = place_in_windows(windows, result, 0)
+    return snapped or result
 
 
 def parse_arrival_time(text: str, queue_date: str) -> Optional[datetime]:
@@ -434,18 +931,27 @@ def assign_agent(tenant: Tenant, service_id: int,
             print(f"⚠️  No active agents in capable list {capable_agent_ids}")
             return None
 
-        # Honor preference if that agent is capable
-        if preferred_agent_id:
-            preferred = next((a for a in active_agents if a.id == preferred_agent_id), None)
-            if preferred:
-                return preferred.id
+        candidate_ids = [a.id for a in active_agents]
 
-        # Assign to agent with shortest backlog
-        best_agent_id = min(
-            active_agents,
-            key=lambda a: get_agent_backlog_minutes(a.id, tenant.id, queue_date)
-        ).id
-        return best_agent_id
+    # Drop anyone not working on this date — off day, or blocked out for the
+    # whole of it. Without this an agent on leave has an empty queue, so zero
+    # backlog, so they would win every single assignment.
+    windows = get_working_windows_for(candidate_ids, tenant, queue_date)
+    candidate_ids = [aid for aid in candidate_ids if windows.get(aid)]
+    if not candidate_ids:
+        print(f"⚠️  No agents working on {queue_date} for tenant {tenant.id}")
+        return None
+
+    # Honor preference if that agent is capable and working.
+    if preferred_agent_id and preferred_agent_id in candidate_ids:
+        return preferred_agent_id
+
+    # Assign to agent with shortest backlog. One batched read for all
+    # candidates rather than a fresh Session and a fresh query per agent.
+    # Ties break on the earlier candidate_ids position, matching min()'s old
+    # first-wins behaviour over active_agents.
+    backlogs = get_agent_backlogs_minutes(candidate_ids, tenant.id, queue_date)
+    return min(candidate_ids, key=lambda aid: backlogs.get(aid, 0))
 
 
 def recalculate_queue(tenant_id: int, agent_id: int, queue_date: str):
@@ -468,6 +974,8 @@ def recalculate_queue(tenant_id: int, agent_id: int, queue_date: str):
             ).order_by(QueueEntry.joined_at)
         ).all()
 
+        services = _service_map(s, entries)
+        windows = get_working_windows(tenant, agent_id, queue_date)
         current_time = now()
         opens = datetime.strptime(
             f"{queue_date} {tenant.queue_opens:02d}:00", "%Y-%m-%d %H:%M"
@@ -475,7 +983,7 @@ def recalculate_queue(tenant_id: int, agent_id: int, queue_date: str):
         # next_free tracks the absolute datetime when the agent becomes free
         next_free = max(opens, current_time)
         for entry in entries:
-            svc = s.get(Service, entry.service_id)
+            svc = services.get(entry.service_id)
             duration = svc.duration_minutes if svc else 60
 
             if entry.status == "InService":
@@ -488,6 +996,11 @@ def recalculate_queue(tenant_id: int, agent_id: int, queue_date: str):
                 start_time = next_free
                 if entry.earliest_arrival:
                     start_time = max(start_time, entry.earliest_arrival)
+                # Then push forward to somewhere the agent is actually working.
+                # If nothing fits — day oversubscribed, or the agent is off —
+                # keep the raw back-to-back time rather than dropping the
+                # customer. Their ETA reads after hours, which is the truth.
+                start_time = place_in_windows(windows, start_time, duration) or start_time
                 entry.estimated_start = start_time
                 s.add(entry)
                 next_free = start_time + timedelta(minutes=duration)
@@ -533,7 +1046,9 @@ def cancel_party(tenant_id: int, entry_id: int) -> List[int]:
         ).all()
         for e in party:
             if e.status in ("Waiting", "InService"):
-                e.status = "Cancelled"
+                e.status      = "Cancelled"
+                e.closed_by   = "customer"   # they cancelled over WhatsApp
+                e.finished_at = now()
                 s.add(e)
                 touched_agents.add(e.agent_id)
         s.commit()
@@ -576,10 +1091,12 @@ def find_walkin_insert_joined_at(
             ).order_by(QueueEntry.joined_at)
         ).all()
 
-        walk_in_svc = s.get(Service, walk_in_service_id)
+        services = _service_map(s, entries)
+        walk_in_svc = services.get(walk_in_service_id) or s.get(Service, walk_in_service_id)
         if not walk_in_svc:
             return None
         walk_in_duration = walk_in_svc.duration_minutes
+        windows = get_working_windows(tenant, assigned_agent_id, queue_date)
 
         opens = datetime.strptime(
             f"{queue_date} {tenant.queue_opens:02d}:00", "%Y-%m-%d %H:%M"
@@ -591,7 +1108,7 @@ def find_walkin_insert_joined_at(
         for entry in entries:
             if exclude_entry_id and entry.id == exclude_entry_id:
                 continue
-            svc = s.get(Service, entry.service_id)
+            svc = services.get(entry.service_id)
             duration = svc.duration_minutes if svc else 60
 
             if entry.status == "InService":
@@ -610,7 +1127,12 @@ def find_walkin_insert_joined_at(
                 if new_arrival:
                     # New entry can't start before its own declared arrival
                     new_start = max(new_start, new_arrival)
-                walk_in_finish = new_start + timedelta(minutes=walk_in_duration)
+                # The gap only exists if the agent is working through it.
+                placed = place_in_windows(windows, new_start, walk_in_duration)
+                if placed is None:
+                    # running_minutes only grows, so no later gap can fit either.
+                    return None
+                walk_in_finish = placed + timedelta(minutes=walk_in_duration)
                 if walk_in_finish <= entry.earliest_arrival:
                     return entry.joined_at - timedelta(seconds=1)
 
@@ -640,16 +1162,113 @@ def format_eta(dt: Optional[datetime]) -> str:
 # 7. MESSAGING HELPERS
 # =============================================================================
 
-def send_text(tenant: Tenant, number: str, text: str):
+def send_text(tenant: Tenant, number: str, text: str, dedupe_key: str = ""):
+    """
+    Queue a WhatsApp message and return immediately — the outbox worker does the
+    actual HTTP call. Callers never block on Evolution and never lose a message
+    to a transient failure.
+
+    dedupe_key, when given, makes the enqueue idempotent: if a message with that
+    key was already queued or sent, this is a no-op. Use it for notifications
+    that would be worse to duplicate than to skip.
+    """
+    if not number:
+        return
+    with Session(engine) as s:
+        if dedupe_key:
+            already = s.exec(
+                select(OutboxMessage).where(OutboxMessage.dedupe_key == dedupe_key)
+            ).first()
+            if already:
+                print(f"⏭️  [{tenant.business_name}] duplicate suppressed | {dedupe_key}")
+                return
+        s.add(OutboxMessage(
+            tenant_id       = tenant.id,
+            to_number       = number,
+            body            = text,
+            dedupe_key      = dedupe_key,
+            # Set explicitly rather than leaning on the field default, which
+            # binds now() at class-definition time.
+            created_at      = now(),
+            next_attempt_at = now(),
+        ))
+        s.commit()
+
+
+async def _send_one(client: httpx.AsyncClient, tenant: Tenant, msg: OutboxMessage):
+    """POST a single queued message to Evolution. Raises on failure."""
     url     = f"{tenant.evolution_api_url.rstrip('/')}/message/sendText/{tenant.evolution_instance}"
     headers = {"apikey": tenant.evolution_api_key, "Content-Type": "application/json"}
-    try:
-        r = requests.post(url, json={"number": number, "text": text}, headers=headers, timeout=10)
-        print(f"📡 [{tenant.business_name}] → {number} | {r.status_code}")
-        return r.json()
-    except Exception as e:
-        print(f"❌ [{tenant.business_name}] send error: {e}")
-        return {"error": str(e)}
+    r = await client.post(
+        url,
+        json={"number": msg.to_number, "text": msg.body},
+        headers=headers,
+        timeout=OUTBOX_SEND_TIMEOUT,
+    )
+    r.raise_for_status()
+    print(f"📡 [{tenant.business_name}] → {msg.to_number} | {r.status_code}")
+
+
+async def drain_outbox_once(client: httpx.AsyncClient) -> int:
+    """
+    Send one batch of due messages, oldest first. Returns how many went out.
+
+    Messages are sent strictly in id order and one at a time: consecutive bot
+    replies ("Welcome" then "Which service?") must arrive in the order they were
+    queued, which concurrent sends would not guarantee. A failing message is
+    marked for retry and the loop moves on, so one unreachable tenant delays
+    others by at most a single timeout per pass rather than blocking forever.
+    """
+    sent = 0
+    with Session(engine) as s:
+        due = s.exec(
+            select(OutboxMessage).where(
+                OutboxMessage.status == "Pending",
+                OutboxMessage.next_attempt_at <= now(),
+            ).order_by(OutboxMessage.id).limit(OUTBOX_BATCH)
+        ).all()
+
+        for msg in due:
+            tenant = s.get(Tenant, msg.tenant_id)
+            msg.attempts += 1
+            try:
+                if not tenant:
+                    raise RuntimeError(f"tenant {msg.tenant_id} no longer exists")
+                await _send_one(client, tenant, msg)
+                msg.status  = "Sent"
+                msg.sent_at = now()
+                sent += 1
+            except Exception as exc:
+                msg.last_error = str(exc)[:500]
+                if msg.attempts >= OUTBOX_MAX_ATTEMPTS:
+                    msg.status = "Failed"
+                    print(f"❌ outbox giving up on msg {msg.id} after "
+                          f"{msg.attempts} attempts: {exc}")
+                else:
+                    # Exponential backoff, capped at 5 min.
+                    delay = min(300, 5 * (2 ** (msg.attempts - 1)))
+                    msg.next_attempt_at = now() + timedelta(seconds=delay)
+                    print(f"⚠️  outbox retry {msg.attempts}/{OUTBOX_MAX_ATTEMPTS} "
+                          f"for msg {msg.id} in {delay}s: {exc}")
+            s.add(msg)
+        s.commit()
+    return sent
+
+
+async def outbox_worker():
+    """Background loop draining the outbox for the life of the process."""
+    print("📤 Outbox worker started")
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                await drain_outbox_once(client)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Never let a bad pass kill the worker — that would silently
+                # stop every outbound message.
+                print(f"❌ outbox worker error: {exc}")
+            await asyncio.sleep(OUTBOX_POLL_SECONDS)
 
 
 def send_main_menu(tenant: Tenant, number: str):
@@ -788,105 +1407,135 @@ def get_notify_number(entry) -> str:
     return entry.customer_number
 
 
-def _notify_job_id(agent_id: int, queue_date: str) -> str:
-    return f"notify_next_{agent_id}_{queue_date}"
-
-
-def _schedule_15min_warning(tenant_id: int, agent_id: int, queue_date: str, duration_minutes: int):
+def _claim_notification(entry_id: int, flag: str) -> bool:
     """
-    Called when an entry goes InService.
-    Schedules a one-shot job to warn the next waiter 15 minutes before this service ends.
+    Atomically claim the right to send one notification for one entry.
+
+    Flips notified_two_away / notified_next from False to True in a single
+    conditional UPDATE and reports whether this caller was the one that flipped
+    it. A read-then-write would let the reconciler and a live status change both
+    decide to send the same message. Returns False if already claimed.
     """
-    delay = max(1, duration_minutes - 15)
-    fire_at = now() + timedelta(minutes=delay)
-    job_id = _notify_job_id(agent_id, queue_date)
-    try:
-        scheduler.remove_job(job_id)
-    except Exception:
-        pass
-    scheduler.add_job(
-        _fire_15min_warning,
-        "date",
-        run_date=fire_at,
-        args=[tenant_id, agent_id, queue_date],
-        id=job_id,
-    )
-    print(f"\U0001f4e5 15-min warning scheduled for agent {agent_id} at {fire_at.strftime('%H:%M')}")
+    from sqlalchemy import text as sql_text
+    if flag not in ("notified_two_away", "notified_next"):
+        raise ValueError(f"unknown notification flag {flag!r}")
+    with Session(engine) as s:
+        result = s.execute(
+            sql_text(
+                f"UPDATE queueentry SET {flag} = :yes "
+                f"WHERE id = :eid AND {flag} = :no"
+            ),
+            {"eid": entry_id, "yes": True, "no": False},
+        )
+        s.commit()
+        return result.rowcount == 1
 
 
-async def _fire_15min_warning(tenant_id: int, agent_id: int, queue_date: str):
-    """Fires ~15 min before the current InService person finishes — warns the next waiter."""
+def _next_waiting(s: Session, tenant_id: int, agent_id: int, queue_date: str):
+    """The entry an agent will serve next, by ETA then arrival order."""
+    return s.exec(
+        select(QueueEntry).where(
+            QueueEntry.agent_id   == agent_id,
+            QueueEntry.tenant_id  == tenant_id,
+            QueueEntry.queue_date == queue_date,
+            QueueEntry.status     == "Waiting",
+        ).order_by(QueueEntry.estimated_start, QueueEntry.joined_at)
+    ).first()
+
+
+def _fire_15min_warning(tenant_id: int, agent_id: int, queue_date: str):
+    """Warns the next waiter that they're roughly 15 minutes out."""
     with Session(engine) as s:
         tenant = s.get(Tenant, tenant_id)
         if not tenant:
             return
-        next_entry = s.exec(
-            select(QueueEntry).where(
-                QueueEntry.agent_id   == agent_id,
-                QueueEntry.tenant_id  == tenant_id,
-                QueueEntry.queue_date == queue_date,
-                QueueEntry.status     == "Waiting",
-            ).order_by(QueueEntry.estimated_start, QueueEntry.joined_at)
-        ).first()
+        next_entry = _next_waiting(s, tenant_id, agent_id, queue_date)
         if not next_entry or next_entry.notified_two_away:
             return
         notify_to = get_notify_number(next_entry)
         if not notify_to:
             return
+        entry_id = next_entry.id
         agent   = s.get(Agent, next_entry.agent_id)
         service = s.get(Service, next_entry.service_id)
-        send_text(tenant, notify_to,
-            f"\u23f3 *Almost your turn at {tenant.business_name}!*\n\n"
-            f"You\'re up in about *15 minutes*.\n"
+        body = (
+            f"⏳ *Almost your turn at {tenant.business_name}!*\n\n"
+            f"You're up in about *15 minutes*.\n"
             f"\U0001f4bc {service.name if service else ''} with {agent.name if agent else tenant.agent_label}\n\n"
             f"Start making your way over \U0001f6b6"
         )
-        next_entry.notified_two_away = True
-        s.add(next_entry)
-        s.commit()
+    # Claim before queueing, so a concurrent caller cannot queue it too.
+    if not _claim_notification(entry_id, "notified_two_away"):
+        return
+    send_text(tenant, notify_to, body, dedupe_key=f"two_away:{entry_id}")
+
+
+def reconcile_notifications() -> int:
+    """
+    Re-derive which notifications are due, from live queue state.
+
+    Runs every RECONCILE_SECONDS. For every agent currently serving someone, if
+    that service is within 15 minutes of finishing, the next waiter gets their
+    warning. Because this reads state rather than replaying a schedule, a
+    restart, a crash or a missed tick cannot lose a notification — worst case it
+    goes out one tick late. That is what makes the warning durable: there is
+    deliberately no persisted timer to lose.
+
+    Returns how many warnings it fired, for logging and tests.
+    """
+    due = []
+    with Session(engine) as s:
+        in_service = s.exec(
+            select(QueueEntry).where(
+                QueueEntry.status     == "InService",
+                QueueEntry.queue_date >= yesterday_str(),
+            )
+        ).all()
+        for entry in in_service:
+            svc      = s.get(Service, entry.service_id)
+            duration = svc.duration_minutes if svc else 60
+            start    = entry.estimated_start or entry.joined_at
+            if now() >= start + timedelta(minutes=duration - 15):
+                due.append((entry.tenant_id, entry.agent_id, entry.queue_date))
+
+    fired = 0
+    for tenant_id, agent_id, queue_date in due:
+        _fire_15min_warning(tenant_id, agent_id, queue_date)
+        fired += 1
+    return fired
 
 
 def _fire_youre_next(tenant_id: int, agent_id: int, queue_date: str):
     """
-    Called when an entry is marked Done / NoShow / Cancelled.
-    Cancels any pending 15-min job and immediately tells the next waiter they're up.
+    Called when an entry is marked Done / NoShow / Cancelled — tells the next
+    waiter they're up, immediately. There is no scheduled 15-minute job to
+    cancel any more: reconcile_notifications derives that warning from live
+    state, and once this entry is claimed the warning is suppressed by the same
+    notified_two_away flag.
     """
-    # Cancel the pending 15-min warning — the InService person is already done
-    try:
-        scheduler.remove_job(_notify_job_id(agent_id, queue_date))
-    except Exception:
-        pass
-
     with Session(engine) as s:
-        tenant = s.exec(
-            select(Tenant).where(Tenant.id == tenant_id)
-        ).first()
+        tenant = s.get(Tenant, tenant_id)
         if not tenant:
             return
-        next_entry = s.exec(
-            select(QueueEntry).where(
-                QueueEntry.agent_id   == agent_id,
-                QueueEntry.tenant_id  == tenant_id,
-                QueueEntry.queue_date == queue_date,
-                QueueEntry.status     == "Waiting",
-            ).order_by(QueueEntry.estimated_start, QueueEntry.joined_at)
-        ).first()
+        next_entry = _next_waiting(s, tenant_id, agent_id, queue_date)
         if not next_entry or next_entry.notified_next:
             return
         notify_to = get_notify_number(next_entry)
         if not notify_to:
             return
+        entry_id = next_entry.id
         agent   = s.get(Agent, next_entry.agent_id)
         service = s.get(Service, next_entry.service_id)
-        send_text(tenant, notify_to,
-            f"\U0001f680 *You\'re up next at {tenant.business_name}!*\n\n"
-            f"Head over now \u2014 {agent.name if agent else tenant.agent_label} is ready for you.\n"
+        body = (
+            f"\U0001f680 *You're up next at {tenant.business_name}!*\n\n"
+            f"Head over now — {agent.name if agent else tenant.agent_label} is ready for you.\n"
             f"\U0001f4bc {service.name if service else ''}"
         )
-        next_entry.notified_next    = True
-        next_entry.notified_two_away = True
-        s.add(next_entry)
-        s.commit()
+    if not _claim_notification(entry_id, "notified_next"):
+        return
+    # Being told "you're up next" makes the 15-minute warning redundant.
+    _claim_notification(entry_id, "notified_two_away")
+    send_text(tenant, notify_to, body, dedupe_key=f"youre_next:{entry_id}")
 
 async def midnight_reset_job():
     """Runs at 00:01 every night. Closes out yesterday's queue."""
@@ -904,7 +1553,12 @@ async def midnight_reset_job():
         for entry in leftover:
             # Never auto-mark as Done — staff never closed it, so it doesn't
             # count as completed work. Abandoned entries close as NoShow.
-            entry.status = "NoShow"
+            entry.status      = "NoShow"
+            # Tagged as ours, not the customer's. Reporting keeps these out of
+            # the no-show rate: nobody knows whether this customer turned up,
+            # only that the shop never closed the entry.
+            entry.closed_by   = "system"
+            entry.finished_at = now()
             s.add(entry)
 
         s.commit()
@@ -920,125 +1574,145 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
                queue_date: str, sess: dict,
                include_parent: bool = True,
                children_names: list = None,
-               earliest_arrival: Optional[datetime] = None):
+               earliest_arrival: Optional[datetime] = None,
+               customer_chose_agent: bool = True):
     """
     Saves queue entries and sends confirmation.
     include_parent=False means only child entries are created (parent is just escorting).
     children_names is a list of child name strings; each gets its own QueueEntry.
     Shared by single-agent auto-assign and manual agent pick paths.
+
+    customer_chose_agent=False means assigned_agent_id was auto-picked rather
+    than requested by name, so it may be re-resolved under the booking lock.
+    Defaults True — never silently override a choice the customer made.
     """
     if children_names is None:
         children_names = []
 
-    backlog  = get_agent_backlog_minutes(assigned_agent_id, tenant.id, queue_date)
-    eta      = calculate_estimated_start(tenant, assigned_agent_id, queue_date, backlog, earliest_arrival)
+    # Serialise assignment + insert. Without the lock two customers confirming
+    # at the same instant both read the pre-insert backlogs and land on the
+    # same agent.
+    with booking_lock(tenant.id, queue_date):
+        # Re-resolve the agent inside the lock unless the customer explicitly
+        # picked one. The auto-pick made before the arrival-time prompt is a
+        # whole round trip stale, and two customers prompted at the same moment
+        # were handed the same agent. Re-resolving can only land on an agent
+        # whose backlog is <= the one already quoted, so the ETA the customer
+        # was shown still holds.
+        if not customer_chose_agent:
+            assigned_agent_id = assign_agent(
+                tenant, service_id, None, queue_date
+            ) or assigned_agent_id
 
-    print(f"\U0001f4be Saving entry | tenant={tenant.id} service={service_id} agent={assigned_agent_id} date={queue_date} parent={include_parent} children={children_names}")
+        backlog  = get_agent_backlog_minutes(assigned_agent_id, tenant.id, queue_date)
+        eta      = calculate_estimated_start(tenant, assigned_agent_id, queue_date, backlog, earliest_arrival)
 
-    child_entries = []
-    parent_entry  = None
-    agent         = None
-    saved_ids     = []  # track all saved entry IDs for rollback
-    try:
-        with Session(engine) as s:
-            total_waiting = len(s.exec(
-                select(QueueEntry).where(
-                    QueueEntry.tenant_id  == tenant.id,
-                    QueueEntry.queue_date == queue_date,
-                    QueueEntry.status     == "Waiting"
-                )
-            ).all())
-            next_position = total_waiting + 1
+        print(f"\U0001f4be Saving entry | tenant={tenant.id} service={service_id} agent={assigned_agent_id} date={queue_date} parent={include_parent} children={children_names}")
 
-            if include_parent:
-                parent_entry = QueueEntry(
-                    tenant_id          = tenant.id,
-                    service_id         = service_id,
-                    agent_id           = assigned_agent_id,
-                    customer_number    = customer_num,
-                    customer_name      = customer_name,
-                    queue_date         = queue_date,
-                    estimated_start    = eta,
-                    earliest_arrival   = earliest_arrival,
-                    position           = next_position,
-                    booked_via         = "whatsapp"
-                )
-                # If this customer finishes before a later appointment is even
-                # due, slot them into that idle gap instead of the queue tail.
-                insert_at = find_walkin_insert_joined_at(
-                    assigned_agent_id, tenant.id, tenant, queue_date,
-                    service_id, new_arrival=earliest_arrival
-                )
-                if insert_at:
-                    parent_entry.joined_at = insert_at
-                s.add(parent_entry)
-                s.commit()
-                s.refresh(parent_entry)
-                saved_ids.append(parent_entry.id)
-                next_position += 1
-
-            # Party root for linkage. With a parent it's the parent; for a
-            # children-only booking the first child becomes the root and the
-            # rest link to it, so cancel_party can find the whole party.
-            party_root_id = parent_entry.id if parent_entry else None
-            for child_name in children_names:
-                # Assign each child independently so free agents are used and
-                # backlogs are accurate after each commit
-                child_agent_id = assign_agent(tenant, service_id, None, queue_date) or assigned_agent_id
-                child_backlog  = get_agent_backlog_minutes(child_agent_id, tenant.id, queue_date)
-                child_eta      = calculate_estimated_start(tenant, child_agent_id, queue_date, child_backlog, earliest_arrival)
-                child_entry = QueueEntry(
-                    tenant_id          = tenant.id,
-                    service_id         = service_id,
-                    agent_id           = child_agent_id,
-                    customer_number    = customer_num,
-                    customer_name      = child_name,
-                    queue_date         = queue_date,
-                    estimated_start    = child_eta,
-                    position           = next_position,
-                    booked_via         = "whatsapp",
-                    parent_entry_id    = party_root_id,
-                    earliest_arrival   = earliest_arrival,
-                )
-                child_insert_at = find_walkin_insert_joined_at(
-                    child_agent_id, tenant.id, tenant, queue_date,
-                    service_id, new_arrival=earliest_arrival
-                )
-                if child_insert_at:
-                    child_entry.joined_at = child_insert_at
-                s.add(child_entry)
-                s.commit()  # commit before next child so backlog recalculates correctly
-                s.refresh(child_entry)
-                saved_ids.append(child_entry.id)
-                # First child in a parentless party becomes the root for siblings
-                if party_root_id is None:
-                    party_root_id = child_entry.id
-                child_entries.append((child_name, next_position, child_agent_id, child_eta))
-                next_position += 1
-
-            agent = s.get(Agent, assigned_agent_id)
-
-    except Exception as exc:
-        print(f"❌ _do_assign failed — rolling back {len(saved_ids)} entries: {exc}")
-        if saved_ids:
+        child_entries = []
+        parent_entry  = None
+        agent         = None
+        saved_ids     = []  # track all saved entry IDs for rollback
+        try:
             with Session(engine) as s:
-                for eid in saved_ids:
-                    row = s.get(QueueEntry, eid)
-                    if row:
-                        s.delete(row)
-                s.commit()
-        send_text(tenant, customer_num,
-            "⚠️ Something went wrong while saving your booking. Please try again or contact the shop directly."
-        )
-        clear_session(tenant.id, customer_num)
-        return
+                total_waiting = len(s.exec(
+                    select(QueueEntry).where(
+                        QueueEntry.tenant_id  == tenant.id,
+                        QueueEntry.queue_date == queue_date,
+                        QueueEntry.status     == "Waiting"
+                    )
+                ).all())
+                next_position = total_waiting + 1
 
-    # Recalculate ETAs for every agent touched by this booking
-    agents_to_recalc = {assigned_agent_id}
-    for _, _, child_agent_id, _ in child_entries:
-        agents_to_recalc.add(child_agent_id)
-    for aid in agents_to_recalc:
-        recalculate_queue(tenant.id, aid, queue_date)
+                if include_parent:
+                    parent_entry = QueueEntry(
+                        tenant_id          = tenant.id,
+                        service_id         = service_id,
+                        agent_id           = assigned_agent_id,
+                        customer_number    = customer_num,
+                        customer_name      = customer_name,
+                        queue_date         = queue_date,
+                        estimated_start    = eta,
+                        earliest_arrival   = earliest_arrival,
+                        position           = next_position,
+                        booked_via         = "whatsapp"
+                    )
+                    # If this customer finishes before a later appointment is even
+                    # due, slot them into that idle gap instead of the queue tail.
+                    insert_at = find_walkin_insert_joined_at(
+                        assigned_agent_id, tenant.id, tenant, queue_date,
+                        service_id, new_arrival=earliest_arrival
+                    )
+                    if insert_at:
+                        parent_entry.joined_at = insert_at
+                    s.add(parent_entry)
+                    s.commit()
+                    s.refresh(parent_entry)
+                    saved_ids.append(parent_entry.id)
+                    next_position += 1
+
+                # Party root for linkage. With a parent it's the parent; for a
+                # children-only booking the first child becomes the root and the
+                # rest link to it, so cancel_party can find the whole party.
+                party_root_id = parent_entry.id if parent_entry else None
+                for child_name in children_names:
+                    # Assign each child independently so free agents are used and
+                    # backlogs are accurate after each commit
+                    child_agent_id = assign_agent(tenant, service_id, None, queue_date) or assigned_agent_id
+                    child_backlog  = get_agent_backlog_minutes(child_agent_id, tenant.id, queue_date)
+                    child_eta      = calculate_estimated_start(tenant, child_agent_id, queue_date, child_backlog, earliest_arrival)
+                    child_entry = QueueEntry(
+                        tenant_id          = tenant.id,
+                        service_id         = service_id,
+                        agent_id           = child_agent_id,
+                        customer_number    = customer_num,
+                        customer_name      = child_name,
+                        queue_date         = queue_date,
+                        estimated_start    = child_eta,
+                        position           = next_position,
+                        booked_via         = "whatsapp",
+                        parent_entry_id    = party_root_id,
+                        earliest_arrival   = earliest_arrival,
+                    )
+                    child_insert_at = find_walkin_insert_joined_at(
+                        child_agent_id, tenant.id, tenant, queue_date,
+                        service_id, new_arrival=earliest_arrival
+                    )
+                    if child_insert_at:
+                        child_entry.joined_at = child_insert_at
+                    s.add(child_entry)
+                    s.commit()  # commit before next child so backlog recalculates correctly
+                    s.refresh(child_entry)
+                    saved_ids.append(child_entry.id)
+                    # First child in a parentless party becomes the root for siblings
+                    if party_root_id is None:
+                        party_root_id = child_entry.id
+                    child_entries.append((child_name, next_position, child_agent_id, child_eta))
+                    next_position += 1
+
+                agent = s.get(Agent, assigned_agent_id)
+
+        except Exception as exc:
+            print(f"❌ _do_assign failed — rolling back {len(saved_ids)} entries: {exc}")
+            if saved_ids:
+                with Session(engine) as s:
+                    for eid in saved_ids:
+                        row = s.get(QueueEntry, eid)
+                        if row:
+                            s.delete(row)
+                    s.commit()
+            send_text(tenant, customer_num,
+                "⚠️ Something went wrong while saving your booking. Please try again or contact the shop directly."
+            )
+            clear_session(tenant.id, customer_num)
+            return
+
+        # Recalculate ETAs for every agent touched by this booking
+        agents_to_recalc = {assigned_agent_id}
+        for _, _, child_agent_id, _ in child_entries:
+            agents_to_recalc.add(child_agent_id)
+        for aid in agents_to_recalc:
+            recalculate_queue(tenant.id, aid, queue_date)
 
     with Session(engine) as s:
         service = s.get(Service, service_id)
@@ -1108,7 +1782,7 @@ def _do_assign(tenant, customer_num: str, customer_name: str,
         )
 
 
-@app.post("/webhook")
+@app.post("/webhook", dependencies=[Depends(verify_webhook_secret)])
 async def handle_webhook(request: Request):
     data = await request.json()
 
@@ -1579,8 +2253,12 @@ async def handle_webhook(request: Request):
 
             assigned_agent_id = assign_agent(tenant, service_id, preferred_agent_id, queue_date)
             if not assigned_agent_id:
+                # Also reachable when everyone is simply off that day, so name
+                # the date — another one may well work.
+                day_name = datetime.strptime(queue_date, "%Y-%m-%d").strftime("%a %d %b")
                 send_text(tenant, customer_num,
-                    f"Sorry, no {tenant.agent_label.lower()}s available. Reply *0* to go back.")
+                    f"Sorry, no {tenant.agent_label.lower()}s are available on "
+                    f"{day_name}.\n\nReply *0* to go back and try another day.")
                 return {"status": "success"}
 
             _backlog = get_agent_backlog_minutes(assigned_agent_id, tenant.id, queue_date)
@@ -1588,6 +2266,10 @@ async def handle_webhook(request: Request):
             set_session(tenant.id, customer_num, {
                 "state":              "awaiting_arrival_time",
                 "pending_agent_id":   assigned_agent_id,
+                # Remember whether this was their pick or ours. The arrival-time
+                # reply comes back a round trip later, by which point an
+                # auto-pick may be stale — _do_assign redoes it under the lock.
+                "pending_agent_explicit": preferred_agent_id is not None,
                 "pending_service_id": service_id,
                 "pending_queue_date": queue_date,
                 "include_parent":     include_parent,
@@ -1732,6 +2414,9 @@ async def handle_webhook(request: Request):
         pending_queue_date = sess.get("pending_queue_date", today_str())
         include_parent     = sess.get("include_parent", True)
         collected          = sess.get("children_collected", [])
+        # Sessions written before this field existed default to True — treat an
+        # unknown pick as the customer's and leave it alone.
+        agent_explicit     = sess.get("pending_agent_explicit", True)
 
         arrival = parse_arrival_time(text, pending_queue_date)
         if arrival is None:
@@ -1744,7 +2429,8 @@ async def handle_webhook(request: Request):
         _do_assign(tenant, customer_num, customer_name,
                    pending_agent_id, pending_service_id, pending_queue_date, sess,
                    include_parent=include_parent, children_names=collected,
-                   earliest_arrival=arrival)
+                   earliest_arrival=arrival,
+                   customer_chose_agent=agent_explicit)
         return {"status": "success"}
 
     # ── FALLBACK ──────────────────────────────────────────────────────────
@@ -1883,10 +2569,20 @@ def get_queue(tenant_id: int, queue_date: Optional[str] = None,
             key=lambda e: (STATUS_ORDER.get(e.status, 9), e.position, e.joined_at)
         )
 
+        # Two batched lookups instead of two queries per row. The dashboard
+        # polls this every 30s per open tab, so a 40-person day was ~80
+        # round trips per tab per poll.
+        services   = _service_map(s, entries)
+        agent_ids  = {e.agent_id for e in entries if e.agent_id is not None}
+        agents     = {
+            a.id: a
+            for a in s.exec(select(Agent).where(Agent.id.in_(agent_ids))).all()
+        } if agent_ids else {}
+
         result = []
         for e in entries:
-            agent   = s.get(Agent, e.agent_id)
-            service = s.get(Service, e.service_id)
+            agent   = agents.get(e.agent_id)
+            service = services.get(e.service_id)
             result.append({
                 "id":               e.id,
                 "customer_name":    e.customer_name,
@@ -1920,19 +2616,25 @@ def update_entry_status(entry_id: int, body: Dict[str, Any],
         agent_id   = entry.agent_id
         tenant_id  = entry.tenant_id
         queue_date = entry.queue_date
-        service_id = entry.service_id
         entry.status = new_status
+        # Timestamps for reporting. Nothing else records when service actually
+        # began or ended — estimated_start is a forecast that recalculation
+        # overwrites, so real wait and service times are only derivable from
+        # here onwards.
+        if new_status == "InService" and not entry.started_at:
+            entry.started_at = now()
+        if new_status in ("Done", "NoShow", "Cancelled"):
+            entry.finished_at = now()
+            entry.closed_by   = "staff"
         s.add(entry)
         s.commit()
 
     recalculate_queue(tenant_id, agent_id, queue_date)
 
-    if new_status == "InService":
-        with Session(engine) as s:
-            svc = s.get(Service, service_id)
-            duration = svc.duration_minutes if svc else 60
-        _schedule_15min_warning(tenant_id, agent_id, queue_date, duration)
-    elif new_status in ("Done", "NoShow", "Cancelled"):
+    # Going InService needs no scheduling — reconcile_notifications picks up the
+    # 15-minute warning from queue state on its next tick, which survives a
+    # restart in a way a scheduled job would not.
+    if new_status in ("Done", "NoShow", "Cancelled"):
         _fire_youre_next(tenant_id, agent_id, queue_date)
 
     return {"status": "updated", "entry_id": entry_id, "new_status": new_status}
@@ -1950,64 +2652,70 @@ def add_walkin(body: Dict[str, Any], user: User = Depends(get_current_user)):
     additional_names = body.get("additional_names", "")
     queue_date       = body.get("queue_date", today_str())
 
-    with Session(engine) as s:
-        tenant = s.get(Tenant, tenant_id)
-        if not tenant:
-            raise HTTPException(status_code=404, detail="Tenant not found")
+    # Same lock the WhatsApp path takes, so a walk-in landing mid-confirmation
+    # can't be handed the agent that booking is about to fill.
+    with booking_lock(tenant_id, queue_date):
+        with Session(engine) as s:
+            tenant = s.get(Tenant, tenant_id)
+            if not tenant:
+                raise HTTPException(status_code=404, detail="Tenant not found")
 
-        # Block walk-ins after closing hours (today only)
-        if queue_date == today_str() and not queue_is_open_today(tenant):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Queue is closed. Opens at {tenant.queue_opens:02d}:00."
+            # Block walk-ins after closing hours (today only)
+            if queue_date == today_str() and not queue_is_open_today(tenant):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Queue is closed. Opens at {tenant.queue_opens:02d}:00."
+                )
+
+            assigned_agent_id = assign_agent(tenant, service_id, agent_id, queue_date)
+            if not assigned_agent_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No {tenant.agent_label.lower()}s can do this service "
+                           f"on {queue_date} — check their schedules and blocks.")
+
+            # Try to slot walk-in before a future appointment if there's a gap
+            insert_joined_at = find_walkin_insert_joined_at(
+                assigned_agent_id, tenant_id, tenant, queue_date, service_id
             )
 
-        assigned_agent_id = assign_agent(tenant, service_id, agent_id, queue_date)
-        if not assigned_agent_id:
-            raise HTTPException(status_code=400, detail="No available agents for this service")
+            backlog  = get_agent_backlog_minutes(assigned_agent_id, tenant_id, queue_date)
+            eta      = calculate_estimated_start(tenant, assigned_agent_id, queue_date, backlog)
 
-        # Try to slot walk-in before a future appointment if there's a gap
-        insert_joined_at = find_walkin_insert_joined_at(
-            assigned_agent_id, tenant_id, tenant, queue_date, service_id
-        )
+            total_waiting = len(s.exec(
+                select(QueueEntry).where(
+                    QueueEntry.tenant_id  == tenant_id,
+                    QueueEntry.queue_date == queue_date,
+                    QueueEntry.status     == "Waiting"
+                )
+            ).all())
 
-        backlog  = get_agent_backlog_minutes(assigned_agent_id, tenant_id, queue_date)
-        eta      = calculate_estimated_start(tenant, assigned_agent_id, queue_date, backlog)
+            clean_phone = normalize_number(phone) if phone else ""
 
-        total_waiting = len(s.exec(
-            select(QueueEntry).where(
-                QueueEntry.tenant_id  == tenant_id,
-                QueueEntry.queue_date == queue_date,
-                QueueEntry.status     == "Waiting"
+            entry = QueueEntry(
+                tenant_id        = tenant_id,
+                service_id       = service_id,
+                agent_id         = assigned_agent_id,
+                # Store captured phone so walk-ins are findable later; fall back to
+                # literal "walkin" when no number was given.
+                customer_number  = clean_phone or "walkin",
+                customer_name    = name,
+                customer_phone   = clean_phone,
+                additional_names = additional_names,
+                queue_date       = queue_date,
+                estimated_start  = eta,
+                position         = total_waiting + 1,
+                booked_via       = "walkin"
             )
-        ).all())
+            if insert_joined_at:
+                entry.joined_at = insert_joined_at
 
-        clean_phone = normalize_number(phone) if phone else ""
+            s.add(entry)
+            s.commit()
+            s.refresh(entry)
 
-        entry = QueueEntry(
-            tenant_id        = tenant_id,
-            service_id       = service_id,
-            agent_id         = assigned_agent_id,
-            # Store captured phone so walk-ins are findable later; fall back to
-            # literal "walkin" when no number was given.
-            customer_number  = clean_phone or "walkin",
-            customer_name    = name,
-            customer_phone   = clean_phone,
-            additional_names = additional_names,
-            queue_date       = queue_date,
-            estimated_start  = eta,
-            position         = total_waiting + 1,
-            booked_via       = "walkin"
-        )
-        if insert_joined_at:
-            entry.joined_at = insert_joined_at
-
-        s.add(entry)
-        s.commit()
-        s.refresh(entry)
-
-    # Recalculate ETAs for the whole agent queue now that the walk-in is inserted
-    recalculate_queue(tenant_id, assigned_agent_id, queue_date)
+        # Recalculate ETAs for the whole agent queue now that the walk-in is inserted
+        recalculate_queue(tenant_id, assigned_agent_id, queue_date)
 
     with Session(engine) as s:
         entry     = s.get(QueueEntry, entry.id)
@@ -2200,6 +2908,447 @@ def update_agent(agent_id: int, updates: Dict[str, Any],
 
 
 # =============================================================================
+# 13b. ADMIN — AGENT SCHEDULES & BLOCKS
+# =============================================================================
+
+WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                 "Friday", "Saturday", "Sunday"]
+
+
+def _load_agent(s: Session, agent_id: int, user: User) -> Agent:
+    agent = s.get(Agent, agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    ensure_tenant_access(user, agent.tenant_id)
+    return agent
+
+
+def _hhmm(minute: int) -> str:
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
+def _parse_dt(value: Any, field: str) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", ""))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400,
+                            detail=f"{field} must be an ISO datetime")
+
+
+@admin_router.get("/admin/agents/{agent_id}/schedule")
+def get_agent_schedule(agent_id: int, user: User = Depends(get_current_user)):
+    """
+    The agent's recurring weekly windows. An empty list means no schedule is
+    set, and the agent falls back to the tenant's opening hours every day.
+    """
+    with Session(engine) as s:
+        _load_agent(s, agent_id, user)
+        rows = s.exec(
+            select(AgentSchedule)
+            .where(AgentSchedule.agent_id == agent_id)
+            .order_by(AgentSchedule.weekday, AgentSchedule.start_minute)
+        ).all()
+        return {
+            "agent_id": agent_id,
+            "uses_tenant_hours": not rows,
+            "windows": [
+                {"id": r.id, "weekday": r.weekday,
+                 "weekday_name": WEEKDAY_NAMES[r.weekday],
+                 "start_minute": r.start_minute, "end_minute": r.end_minute,
+                 "start": _hhmm(r.start_minute), "end": _hhmm(r.end_minute)}
+                for r in rows
+            ],
+        }
+
+
+@admin_router.put("/admin/agents/{agent_id}/schedule")
+def set_agent_schedule(agent_id: int, body: Dict[str, Any],
+                       user: User = Depends(get_current_user)):
+    """
+    Replace the agent's whole weekly schedule.
+
+    Body: {"windows": [{"weekday": 0, "start_minute": 480, "end_minute": 1020}, …]}
+
+    Replace-all rather than per-row edits, because a schedule is read as a
+    whole and a half-applied one would silently take a working day off the
+    board. Sending an empty list clears the schedule and returns the agent to
+    the tenant's opening hours.
+
+    Two windows on the same weekday make a split shift; the gap between them is
+    simply not worked. Overlapping windows are accepted and coalesce on read.
+    """
+    windows = body.get("windows")
+    if not isinstance(windows, list):
+        raise HTTPException(status_code=400, detail="windows must be a list")
+
+    cleaned = []
+    for w in windows:
+        if not isinstance(w, dict):
+            raise HTTPException(status_code=400, detail="each window must be an object")
+        try:
+            weekday = int(w["weekday"])
+            start   = int(w["start_minute"])
+            end     = int(w["end_minute"])
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="each window needs integer weekday, start_minute, end_minute")
+        if not 0 <= weekday <= 6:
+            raise HTTPException(status_code=400,
+                                detail="weekday must be 0 (Monday) to 6 (Sunday)")
+        if not 0 <= start < end <= 24 * 60:
+            raise HTTPException(
+                status_code=400,
+                detail="need 0 <= start_minute < end_minute <= 1440")
+        cleaned.append((weekday, start, end))
+
+    with Session(engine) as s:
+        agent = _load_agent(s, agent_id, user)
+        tenant_id = agent.tenant_id
+        for row in s.exec(
+            select(AgentSchedule).where(AgentSchedule.agent_id == agent_id)
+        ).all():
+            s.delete(row)
+        for weekday, start, end in cleaned:
+            s.add(AgentSchedule(tenant_id=tenant_id, agent_id=agent_id,
+                                weekday=weekday, start_minute=start,
+                                end_minute=end))
+        s.commit()
+
+    # Today's ETAs were computed against the old hours — restate them now
+    # rather than leaving customers holding times nobody will honour.
+    recalculate_queue(tenant_id, agent_id, today_str())
+    return get_agent_schedule(agent_id, user)
+
+
+@admin_router.get("/admin/agents/{agent_id}/blocks")
+def list_agent_blocks(agent_id: int, from_date: Optional[str] = None,
+                      to_date: Optional[str] = None,
+                      user: User = Depends(get_current_user)):
+    """One-off unavailable windows. Defaults to today onward."""
+    start = _parse_dt(f"{from_date}T00:00:00", "from_date") if from_date \
+        else datetime.strptime(today_str(), "%Y-%m-%d")
+    with Session(engine) as s:
+        _load_agent(s, agent_id, user)
+        conditions = [AgentBlock.agent_id == agent_id, AgentBlock.ends_at > start]
+        if to_date:
+            conditions.append(
+                AgentBlock.starts_at < _parse_dt(f"{to_date}T00:00:00", "to_date")
+                + timedelta(days=1))
+        rows = s.exec(
+            select(AgentBlock).where(*conditions).order_by(AgentBlock.starts_at)
+        ).all()
+        return [
+            {"id": r.id, "agent_id": r.agent_id, "reason": r.reason,
+             "starts_at": r.starts_at.isoformat(), "ends_at": r.ends_at.isoformat()}
+            for r in rows
+        ]
+
+
+@admin_router.post("/admin/agents/{agent_id}/blocks")
+def create_agent_block(agent_id: int, body: Dict[str, Any],
+                       user: User = Depends(get_current_user)):
+    """Body: {"starts_at": ISO, "ends_at": ISO, "reason": "Lunch"}"""
+    starts_at = _parse_dt(body.get("starts_at"), "starts_at")
+    ends_at   = _parse_dt(body.get("ends_at"), "ends_at")
+    if ends_at <= starts_at:
+        raise HTTPException(status_code=400, detail="ends_at must be after starts_at")
+
+    with Session(engine) as s:
+        agent = _load_agent(s, agent_id, user)
+        block = AgentBlock(tenant_id=agent.tenant_id, agent_id=agent_id,
+                           starts_at=starts_at, ends_at=ends_at,
+                           reason=str(body.get("reason", ""))[:200])
+        s.add(block)
+        s.commit()
+        s.refresh(block)
+        result = {"id": block.id, "agent_id": agent_id, "reason": block.reason,
+                  "starts_at": block.starts_at.isoformat(),
+                  "ends_at": block.ends_at.isoformat()}
+        tenant_id = agent.tenant_id
+
+    # Anyone already booked into the blocked window needs a new time.
+    recalculate_queue(tenant_id, agent_id, starts_at.date().isoformat())
+    return result
+
+
+@admin_router.delete("/admin/blocks/{block_id}")
+def delete_agent_block(block_id: int, user: User = Depends(get_current_user)):
+    with Session(engine) as s:
+        block = s.get(AgentBlock, block_id)
+        if not block:
+            raise HTTPException(status_code=404, detail="Block not found")
+        ensure_tenant_access(user, block.tenant_id)
+        tenant_id, agent_id = block.tenant_id, block.agent_id
+        queue_date = block.starts_at.date().isoformat()
+        s.delete(block)
+        s.commit()
+
+    recalculate_queue(tenant_id, agent_id, queue_date)
+    return {"status": "deleted", "block_id": block_id}
+
+
+@admin_router.get("/admin/agents/{agent_id}/windows")
+def get_agent_windows(agent_id: int, queue_date: Optional[str] = None,
+                      user: User = Depends(get_current_user)):
+    """
+    The windows actually used for scheduling on a date — schedule resolved for
+    that weekday, blocks already subtracted. This is what the queue engine
+    sees, so it's the honest answer to "why was nobody booked at 14:00?".
+    """
+    target = queue_date or today_str()
+    with Session(engine) as s:
+        agent  = _load_agent(s, agent_id, user)
+        tenant = s.get(Tenant, agent.tenant_id)
+
+    windows = get_working_windows(tenant, agent_id, target)
+    return {
+        "agent_id": agent_id,
+        "queue_date": target,
+        "working": bool(windows),
+        "windows": [
+            {"start": w[0].isoformat(), "end": w[1].isoformat(),
+             "minutes": int((w[1] - w[0]).total_seconds() // 60)}
+            for w in windows
+        ],
+    }
+
+
+# =============================================================================
+# 13c. ADMIN — ANALYTICS
+# =============================================================================
+
+ANALYTICS_MAX_DAYS = 366
+
+
+def _median(values: List[float]) -> Optional[int]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return int(ordered[mid])
+    return int((ordered[mid - 1] + ordered[mid]) / 2)
+
+
+def _percentile(values: List[float], pct: float) -> Optional[int]:
+    """
+    Nearest-rank percentile: the smallest value at or below which `pct` of the
+    sample falls. Samples here are small, so no interpolation.
+
+    p90 of nine 5s and one 120 is 5, not 120 — the point is "90% of customers
+    waited no longer than this", which the slowest single outlier does not set.
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, min(len(ordered), math.ceil(pct / 100 * len(ordered))))
+    return int(ordered[rank - 1])
+
+
+def _duration_stats(values: List[float]) -> Dict[str, Any]:
+    """
+    Report a duration only when there is something to report. An empty result
+    says so rather than showing a zero that reads like a real measurement.
+    """
+    return {
+        "available": bool(values),
+        "samples":   len(values),
+        "median_minutes": _median(values),
+        "p90_minutes":    _percentile(values, 90),
+    }
+
+
+@admin_router.get("/admin/analytics/{tenant_id}")
+def get_analytics(tenant_id: int, from_date: Optional[str] = None,
+                  to_date: Optional[str] = None,
+                  user: User = Depends(get_current_user)):
+    """
+    Aggregates for one business over a date range (default: the last 30 days,
+    inclusive of today).
+
+    The care taken here is mostly about *not* reporting things:
+
+    * A no-show closed by the midnight sweep is not a no-show. It means nobody
+      tapped Done. Those are counted separately as `unclosed`, and the no-show
+      rate is withheld entirely (`null`) for any period containing rows from
+      before provenance was tracked, rather than quietly reading low.
+    * Rates are computed over closed entries only. Including a queue that is
+      still running would drag every rate down as the day progresses.
+    * Wait and service times come from `started_at` / `finished_at`, which only
+      exist from the upgrade onwards. When there are no samples the block says
+      `available: false` instead of showing zero.
+    * `minutes_booked` is scheduled duration, not measured — labelled as such.
+    """
+    ensure_tenant_access(user, tenant_id)
+
+    end   = to_date or today_str()
+    start = from_date or (
+        datetime.strptime(end, "%Y-%m-%d") - timedelta(days=29)
+    ).date().isoformat()
+    try:
+        span = (datetime.strptime(end, "%Y-%m-%d")
+                - datetime.strptime(start, "%Y-%m-%d")).days + 1
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Dates must be YYYY-MM-DD")
+    if span < 1:
+        raise HTTPException(status_code=400, detail="to_date must not precede from_date")
+    if span > ANALYTICS_MAX_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Range is limited to {ANALYTICS_MAX_DAYS} days")
+
+    with Session(engine) as s:
+        entries = s.exec(
+            select(QueueEntry).where(
+                QueueEntry.tenant_id  == tenant_id,
+                QueueEntry.queue_date >= start,
+                QueueEntry.queue_date <= end,
+            )
+        ).all()
+        # Batched, like everywhere else in the engine — never one query per row.
+        agents = {a.id: a for a in s.exec(
+            select(Agent).where(Agent.tenant_id == tenant_id)).all()}
+        services = {sv.id: sv for sv in s.exec(
+            select(Service).where(Service.tenant_id == tenant_id)).all()}
+
+    done = no_show_staff = no_show_system = no_show_unknown = 0
+    cancelled_customer = cancelled_other = still_open = 0
+    by_day: Dict[str, Dict[str, int]] = {}
+    by_weekday = [0] * 7
+    by_hour    = [0] * 24
+    channel    = {"whatsapp": 0, "walkin": 0}
+    per_agent: Dict[int, Dict[str, int]] = {}
+    per_service: Dict[int, Dict[str, int]] = {}
+    wait_minutes: List[float]    = []
+    service_minutes: List[float] = []
+
+    for e in entries:
+        day = by_day.setdefault(e.queue_date, {"bookings": 0, "done": 0})
+        day["bookings"] += 1
+        try:
+            by_weekday[datetime.strptime(e.queue_date, "%Y-%m-%d").weekday()] += 1
+        except ValueError:
+            pass
+        if e.joined_at:
+            by_hour[e.joined_at.hour] += 1
+        channel[e.booked_via if e.booked_via in channel else "walkin"] += 1
+
+        a = per_agent.setdefault(e.agent_id, {"bookings": 0, "done": 0,
+                                              "no_shows": 0, "unclosed": 0})
+        a["bookings"] += 1
+        sv = per_service.setdefault(e.service_id, {"bookings": 0, "minutes_booked": 0})
+        sv["bookings"] += 1
+        svc = services.get(e.service_id)
+        sv["minutes_booked"] += svc.duration_minutes if svc else 0
+
+        if e.status == "Done":
+            done += 1
+            day["done"] += 1
+            a["done"] += 1
+        elif e.status == "NoShow":
+            if e.closed_by == "system":
+                no_show_system += 1
+                a["unclosed"] += 1
+            elif e.closed_by:
+                no_show_staff += 1
+                a["no_shows"] += 1
+            else:
+                no_show_unknown += 1
+        elif e.status == "Cancelled":
+            if e.closed_by == "customer":
+                cancelled_customer += 1
+            else:
+                cancelled_other += 1
+        else:
+            still_open += 1
+
+        if e.started_at and e.joined_at:
+            wait = (e.started_at - e.joined_at).total_seconds() / 60
+            if wait >= 0:
+                wait_minutes.append(wait)
+        if e.status == "Done" and e.started_at and e.finished_at:
+            served = (e.finished_at - e.started_at).total_seconds() / 60
+            if served >= 0:
+                service_minutes.append(served)
+
+    cancelled = cancelled_customer + cancelled_other
+    no_shows  = no_show_staff + no_show_unknown
+    closed    = done + no_shows + no_show_system + cancelled
+
+    def rate(count):
+        return round(count / closed, 4) if closed else None
+
+    # Withheld rather than understated: with untagged rows in the range there
+    # is no way to tell a real no-show from an entry staff forgot to close.
+    no_show_rate = rate(no_show_staff) if no_show_unknown == 0 else None
+
+    return {
+        "tenant_id": tenant_id,
+        "from_date": start,
+        "to_date":   end,
+        "days":      span,
+        "totals": {
+            "bookings":           len(entries),
+            "done":               done,
+            "no_shows":           no_show_staff,
+            "no_shows_untracked": no_show_unknown,
+            "unclosed":           no_show_system,
+            "cancelled":          cancelled,
+            "cancelled_by_customer": cancelled_customer,
+            "still_open":         still_open,
+            "closed":             closed,
+        },
+        "rates": {
+            "completion":   rate(done),
+            "no_show":      no_show_rate,
+            "no_show_note": None if no_show_unknown == 0 else (
+                f"{no_show_unknown} no-shows in this range predate close tracking, "
+                f"so a real no-show can't be told apart from an entry nobody "
+                f"closed. Rate withheld."),
+            "cancellation": rate(cancelled),
+            "unclosed":     rate(no_show_system),
+        },
+        "channel": channel,
+        "by_day": [
+            {"date": d, "weekday": WEEKDAY_NAMES[
+                datetime.strptime(d, "%Y-%m-%d").weekday()][:3],
+             **by_day[d]}
+            for d in sorted(by_day)
+        ],
+        "by_weekday": [
+            {"weekday": i, "name": WEEKDAY_NAMES[i], "bookings": n}
+            for i, n in enumerate(by_weekday)
+        ],
+        "by_hour": [{"hour": h, "bookings": n} for h, n in enumerate(by_hour)],
+        "by_agent": sorted((
+            {"agent_id": aid,
+             "name": agents[aid].name if aid in agents else "(removed)",
+             **vals}
+            for aid, vals in per_agent.items()
+        ), key=lambda r: -r["bookings"]),
+        "by_service": sorted((
+            {"service_id": sid,
+             "name": services[sid].name if sid in services else "(removed)",
+             **vals}
+            for sid, vals in per_service.items()
+        ), key=lambda r: -r["bookings"]),
+        # Measured, not estimated — and only from the upgrade onwards.
+        "wait_time":    _duration_stats(wait_minutes),
+        "service_time": _duration_stats(service_minutes),
+        "data_quality": {
+            "unclosed": no_show_system,
+            "untracked_closes": no_show_unknown,
+            "note": ("Entries the midnight sweep closed because staff never "
+                     "marked them Done. High numbers mean the dashboard isn't "
+                     "being kept up to date, not that customers didn't arrive."),
+        },
+    }
+
+
+# =============================================================================
 # 14. HEALTH + UTILS
 # =============================================================================
 
@@ -2212,7 +3361,17 @@ def health():
         redis_ok = str(e)
     with Session(engine) as s:
         tenants = len(s.exec(select(Tenant)).all())
-    return {"status": "ok", "redis": redis_ok, "tenants": tenants}
+        # A climbing pending count or any failures means messages aren't
+        # reaching customers — worth alerting on.
+        outbox_pending = len(s.exec(
+            select(OutboxMessage).where(OutboxMessage.status == "Pending")
+        ).all())
+        outbox_failed = len(s.exec(
+            select(OutboxMessage).where(OutboxMessage.status == "Failed")
+        ).all())
+    return {"status": "ok", "redis": redis_ok, "tenants": tenants,
+            "webhook_auth": bool(WEBHOOK_SECRETS),
+            "outbox_pending": outbox_pending, "outbox_failed": outbox_failed}
 
 
 @admin_router.post("/admin/migrate-reset")

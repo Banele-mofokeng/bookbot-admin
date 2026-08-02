@@ -13,6 +13,10 @@ const NAV = [
     to: '/agents', label: 'Agents',
     icon: <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="6" cy="5" r="2.5" stroke="currentColor" strokeWidth="1.3"/><path d="M2 13c0-2.2 1.8-4 4-4s4 1.8 4 4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/><circle cx="11.5" cy="5.5" r="1.8" stroke="currentColor" strokeWidth="1.3"/><path d="M13.5 13c0-1.6-1-2.9-2.5-3.3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
   },
+  {
+    to: '/reports', label: 'Reports',
+    icon: <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 14h12" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/><rect x="3" y="8" width="2.5" height="4" rx="0.8" stroke="currentColor" strokeWidth="1.3"/><rect x="6.8" y="5" width="2.5" height="7" rx="0.8" stroke="currentColor" strokeWidth="1.3"/><rect x="10.6" y="2.5" width="2.5" height="9.5" rx="0.8" stroke="currentColor" strokeWidth="1.3"/></svg>
+  },
 ]
 
 const SUPER_NAV = [
