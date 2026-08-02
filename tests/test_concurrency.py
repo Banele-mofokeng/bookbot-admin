@@ -24,7 +24,8 @@ from sqlalchemy import event
 from sqlmodel import Session, select
 
 import main
-from main import Tenant, Service, Agent, AgentService, QueueEntry
+from app import config, core, db, queue_engine, sessions
+from app.models import Tenant, Service, Agent, AgentService, QueueEntry
 
 
 DATE = "2026-06-20"
@@ -40,16 +41,16 @@ def count_queries():
         box["n"] += 1
         box["sql"].append(statement)
 
-    event.listen(main.engine, "before_cursor_execute", before)
+    event.listen(db.engine, "before_cursor_execute", before)
     try:
         yield box
     finally:
-        event.remove(main.engine, "before_cursor_execute", before)
+        event.remove(db.engine, "before_cursor_execute", before)
 
 
 def _seed(n_agents=1, n_services=1):
     """Tenant + agents, every agent able to do every service."""
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         t = Tenant(
             business_name="Test Co", whatsapp_number="27810000000",
             evolution_instance="i", evolution_api_key="k",
@@ -77,13 +78,13 @@ def _seed(n_agents=1, n_services=1):
 
 
 def _tenant(tenant_id):
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         return s.get(Tenant, tenant_id)
 
 
 def _fill(tenant_id, svc_ids, agent_ids, per_agent):
     """per_agent Waiting entries for each agent, cycling through services."""
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         n = 0
         for aid in agent_ids:
             for i in range(per_agent):
@@ -106,11 +107,11 @@ def test_backlog_query_count_is_flat_in_entries():
 
     _fill(tid, svcs, [aid], per_agent=2)
     with count_queries() as small:
-        main.get_agent_backlog_minutes(aid, tid, DATE)
+        queue_engine.get_agent_backlog_minutes(aid, tid, DATE)
 
     _fill(tid, svcs, [aid], per_agent=10)
     with count_queries() as big:
-        main.get_agent_backlog_minutes(aid, tid, DATE)
+        queue_engine.get_agent_backlog_minutes(aid, tid, DATE)
 
     assert small["n"] == big["n"], (
         f"query count grew with rows: {small['n']} -> {big['n']}\n"
@@ -124,9 +125,9 @@ def test_batched_backlog_query_count_is_flat_in_agents():
     _fill(tid, svcs, agents, per_agent=4)
 
     with count_queries() as one:
-        main.get_agent_backlogs_minutes(agents[:1], tid, DATE)
+        queue_engine.get_agent_backlogs_minutes(agents[:1], tid, DATE)
     with count_queries() as many:
-        main.get_agent_backlogs_minutes(agents, tid, DATE)
+        queue_engine.get_agent_backlogs_minutes(agents, tid, DATE)
 
     assert one["n"] == many["n"] <= 2
 
@@ -136,9 +137,9 @@ def test_batched_backlog_matches_the_single_agent_version():
     tid, svcs, agents = _seed(n_agents=4, n_services=3)
     _fill(tid, svcs, agents, per_agent=3)
 
-    batched = main.get_agent_backlogs_minutes(agents, tid, DATE)
+    batched = queue_engine.get_agent_backlogs_minutes(agents, tid, DATE)
     for aid in agents:
-        assert batched[aid] == main.get_agent_backlog_minutes(aid, tid, DATE)
+        assert batched[aid] == queue_engine.get_agent_backlog_minutes(aid, tid, DATE)
 
 
 def test_assign_agent_query_count_is_flat_in_agents():
@@ -146,12 +147,12 @@ def test_assign_agent_query_count_is_flat_in_agents():
     tid_a, svcs_a, agents_a = _seed(n_agents=1, n_services=2)
     _fill(tid_a, svcs_a, agents_a, per_agent=5)
     with count_queries() as one_agent:
-        main.assign_agent(_tenant(tid_a), svcs_a[0], None, DATE)
+        queue_engine.assign_agent(_tenant(tid_a), svcs_a[0], None, DATE)
 
     tid_b, svcs_b, agents_b = _seed(n_agents=8, n_services=2)
     _fill(tid_b, svcs_b, agents_b, per_agent=5)
     with count_queries() as many_agents:
-        main.assign_agent(_tenant(tid_b), svcs_b[0], None, DATE)
+        queue_engine.assign_agent(_tenant(tid_b), svcs_b[0], None, DATE)
 
     assert one_agent["n"] == many_agents["n"], (
         f"{one_agent['n']} -> {many_agents['n']} for 1 -> 8 agents\n"
@@ -165,7 +166,7 @@ def test_assign_agent_still_picks_the_shortest_backlog():
     _fill(tid, [svc], [busy], per_agent=5)
     _fill(tid, [svc], [medium], per_agent=2)
 
-    assert main.assign_agent(_tenant(tid), svc, None, DATE) == free
+    assert queue_engine.assign_agent(_tenant(tid), svc, None, DATE) == free
 
 
 def test_assign_agent_still_honours_an_explicit_preference():
@@ -173,7 +174,7 @@ def test_assign_agent_still_honours_an_explicit_preference():
     busy = agents[0]
     _fill(tid, [svc], [busy], per_agent=5)
 
-    assert main.assign_agent(_tenant(tid), svc, busy, DATE) == busy
+    assert queue_engine.assign_agent(_tenant(tid), svc, busy, DATE) == busy
 
 
 def test_recalculate_queue_query_count_is_flat_in_entries():
@@ -181,11 +182,11 @@ def test_recalculate_queue_query_count_is_flat_in_entries():
 
     _fill(tid, svcs, [aid], per_agent=2)
     with count_queries() as small:
-        main.recalculate_queue(tid, aid, DATE)
+        queue_engine.recalculate_queue(tid, aid, DATE)
 
     _fill(tid, svcs, [aid], per_agent=10)
     with count_queries() as big:
-        main.recalculate_queue(tid, aid, DATE)
+        queue_engine.recalculate_queue(tid, aid, DATE)
 
     # Row UPDATEs are per-entry by nature; only SELECTs should be flat.
     small_reads = [q for q in small["sql"] if q.lstrip().upper().startswith("SELECT")]
@@ -199,11 +200,11 @@ def test_gap_fill_query_count_is_flat_in_entries():
 
     _fill(tid, svcs, [aid], per_agent=2)
     with count_queries() as small:
-        main.find_walkin_insert_joined_at(aid, tid, tenant, DATE, svcs[0])
+        queue_engine.find_walkin_insert_joined_at(aid, tid, tenant, DATE, svcs[0])
 
     _fill(tid, svcs, [aid], per_agent=10)
     with count_queries() as big:
-        main.find_walkin_insert_joined_at(aid, tid, tenant, DATE, svcs[0])
+        queue_engine.find_walkin_insert_joined_at(aid, tid, tenant, DATE, svcs[0])
 
     assert small["n"] == big["n"], "\n".join(big["sql"])
 
@@ -215,10 +216,10 @@ def test_gap_fill_still_slots_in_before_a_later_appointment(monkeypatch):
     day, so a real now() months away from DATE has no window to sit in.
     """
     frozen = datetime(2026, 6, 20, 10, 0)
-    monkeypatch.setattr(main, "now", lambda: frozen)
+    monkeypatch.setattr(core, "now", lambda: frozen)
 
     tid, [svc], [aid] = _seed(n_agents=1, n_services=1)
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         s.add(QueueEntry(
             tenant_id=tid, service_id=svc, agent_id=aid,
             customer_number="2781x", customer_name="Later", status="Waiting",
@@ -228,7 +229,7 @@ def test_gap_fill_still_slots_in_before_a_later_appointment(monkeypatch):
         s.commit()
 
     tenant = _tenant(tid)
-    assert main.find_walkin_insert_joined_at(aid, tid, tenant, DATE, svc) is not None
+    assert queue_engine.find_walkin_insert_joined_at(aid, tid, tenant, DATE, svc) is not None
 
 
 def test_get_queue_query_count_is_flat_in_rows(super_token):
@@ -273,7 +274,7 @@ def test_get_queue_tolerates_a_deleted_service(super_token):
     c = TestClient(main.app)
     tid, [svc], [aid] = _seed(n_agents=1, n_services=1)
     _fill(tid, [svc], [aid], per_agent=1)
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         s.delete(s.get(Service, svc)); s.commit()
 
     rows = c.get(f"/admin/queue/{tid}?queue_date={DATE}",
@@ -319,13 +320,13 @@ class BrokenRedis:
 @pytest.fixture
 def fake_redis(monkeypatch):
     fake = FakeRedis()
-    monkeypatch.setattr(main, "redis_client", fake)
+    monkeypatch.setattr(config, "redis_client", fake)
     return fake
 
 
 def test_lock_is_acquired_and_released(fake_redis):
     key = f"lock:booking:1:{DATE}"
-    with main.booking_lock(1, DATE) as held:
+    with sessions.booking_lock(1, DATE) as held:
         assert held is True
         assert list(fake_redis.store) == [key]
         assert fake_redis.store[key], "lock must carry an owner token"
@@ -334,16 +335,16 @@ def test_lock_is_acquired_and_released(fake_redis):
 
 def test_lock_is_released_even_when_the_body_raises(fake_redis):
     with pytest.raises(RuntimeError):
-        with main.booking_lock(1, DATE):
+        with sessions.booking_lock(1, DATE):
             raise RuntimeError("boom")
     assert fake_redis.store == {}, "a failed booking would wedge the tenant"
 
 
 def test_lock_is_scoped_per_tenant_and_date(fake_redis):
     """Two businesses booking at once must not wait on each other."""
-    with main.booking_lock(1, DATE) as a:
-        with main.booking_lock(2, DATE) as b:
-            with main.booking_lock(1, "2026-06-21") as c:
+    with sessions.booking_lock(1, DATE) as a:
+        with sessions.booking_lock(2, DATE) as b:
+            with sessions.booking_lock(1, "2026-06-21") as c:
                 assert (a, b, c) == (True, True, True)
 
 
@@ -353,11 +354,11 @@ def test_second_holder_waits_then_proceeds_unlocked(fake_redis, monkeypatch):
     long spin stalls the event loop. Losing the booking is worse than a rare
     unlocked one, so it proceeds rather than raising.
     """
-    monkeypatch.setattr(main, "BOOKING_LOCK_WAIT", 0.05)
-    with main.booking_lock(1, DATE) as first:
+    monkeypatch.setattr(config, "BOOKING_LOCK_WAIT", 0.05)
+    with sessions.booking_lock(1, DATE) as first:
         assert first is True
         started = real_time.monotonic()
-        with main.booking_lock(1, DATE) as second:
+        with sessions.booking_lock(1, DATE) as second:
             waited = real_time.monotonic() - started
             assert second is False, "should not claim a lock it never got"
         assert waited >= 0.05, "must actually wait before giving up"
@@ -370,15 +371,15 @@ def test_release_is_compare_and_delete(fake_redis, monkeypatch):
     would release their lock. Simulate by overwriting the token mid-block.
     """
     key = f"lock:booking:1:{DATE}"
-    with main.booking_lock(1, DATE):
+    with sessions.booking_lock(1, DATE):
         fake_redis.store[key] = "somebody-elses-token"
     assert fake_redis.store[key] == "somebody-elses-token"
 
 
 def test_lock_degrades_open_when_redis_is_down(monkeypatch):
-    monkeypatch.setattr(main, "redis_client", BrokenRedis())
+    monkeypatch.setattr(config, "redis_client", BrokenRedis())
     ran = False
-    with main.booking_lock(1, DATE) as held:
+    with sessions.booking_lock(1, DATE) as held:
         assert held is False
         ran = True
     assert ran, "an unreachable Redis must not block bookings"
@@ -389,12 +390,12 @@ def test_lock_serialises_two_threads(fake_redis, monkeypatch):
     The point of the lock: critical sections must not overlap. Each thread
     marks itself in, sleeps, and asserts nobody else got in meanwhile.
     """
-    monkeypatch.setattr(main, "BOOKING_LOCK_WAIT", 5.0)
+    monkeypatch.setattr(config, "BOOKING_LOCK_WAIT", 5.0)
     inside = []
     overlaps = []
 
     def book():
-        with main.booking_lock(1, DATE) as held:
+        with sessions.booking_lock(1, DATE) as held:
             assert held, "5s wait should be ample"
             inside.append(1)
             if len(inside) > 1:
@@ -452,7 +453,7 @@ def test_walkin_releases_the_lock_on_a_rejected_booking(super_token, fake_redis)
     from fastapi.testclient import TestClient
     c = TestClient(main.app)
     tid, [svc], [aid] = _seed(n_agents=1, n_services=1)
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         t = s.get(Tenant, tid)
         t.queue_opens, t.queue_closes = 23, 23   # shut all day
         s.add(t); s.commit()
@@ -460,6 +461,6 @@ def test_walkin_releases_the_lock_on_a_rejected_booking(super_token, fake_redis)
     r = c.post("/admin/queue/walkin",
                headers={"Authorization": f"Bearer {super_token}"},
                json={"tenant_id": tid, "service_id": svc, "agent_id": aid,
-                     "customer_name": "W", "queue_date": main.today_str()})
+                     "customer_name": "W", "queue_date": core.today_str()})
     assert r.status_code == 400
     assert fake_redis.store == {}, "a rejected walk-in wedged the tenant"

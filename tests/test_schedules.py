@@ -17,8 +17,8 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
 import main
-from main import (Tenant, Service, Agent, AgentService, QueueEntry,
-                  AgentSchedule, AgentBlock)
+from app import core, db, queue_engine
+from app.models import Tenant, Service, Agent, AgentService, QueueEntry, AgentSchedule, AgentBlock
 
 
 DATE = "2026-06-20"          # Saturday
@@ -32,7 +32,7 @@ def at(hour, minute=0, day=20):
 
 @pytest.fixture
 def frozen_now(monkeypatch):
-    monkeypatch.setattr(main, "now", lambda: NOW)
+    monkeypatch.setattr(core, "now", lambda: NOW)
     return NOW
 
 
@@ -43,7 +43,7 @@ def test_date_really_is_a_saturday():
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 def _tenant(opens=8, closes=17):
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         t = Tenant(business_name="Sched Co", whatsapp_number="27810000000",
                    evolution_instance="i", evolution_api_key="k",
                    evolution_api_url="http://x",
@@ -53,14 +53,14 @@ def _tenant(opens=8, closes=17):
 
 
 def _service(tenant_id, minutes):
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         sv = Service(tenant_id=tenant_id, name=f"S{minutes}", duration_minutes=minutes)
         s.add(sv); s.commit(); s.refresh(sv)
         return sv.id
 
 
 def _agent(tenant_id, service_ids=(), name="A"):
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         a = Agent(tenant_id=tenant_id, name=name)
         s.add(a); s.commit(); s.refresh(a)
         for sid in service_ids:
@@ -70,7 +70,7 @@ def _agent(tenant_id, service_ids=(), name="A"):
 
 
 def _schedule(tenant_id, agent_id, weekday, start_min, end_min):
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         s.add(AgentSchedule(tenant_id=tenant_id, agent_id=agent_id,
                             weekday=weekday, start_minute=start_min,
                             end_minute=end_min))
@@ -78,7 +78,7 @@ def _schedule(tenant_id, agent_id, weekday, start_min, end_min):
 
 
 def _block(tenant_id, agent_id, starts_at, ends_at, reason=""):
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         b = AgentBlock(tenant_id=tenant_id, agent_id=agent_id,
                        starts_at=starts_at, ends_at=ends_at, reason=reason)
         s.add(b); s.commit(); s.refresh(b)
@@ -98,7 +98,7 @@ def _entry(tenant_id, service_id, agent_id, *, status="Waiting",
            estimated_start=None, earliest_arrival=None, joined_at=None,
            date=DATE, name="C"):
     _seq[0] += 1
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         e = QueueEntry(tenant_id=tenant_id, service_id=service_id,
                        agent_id=agent_id, customer_number="2781000",
                        customer_name=name, status=status, queue_date=date,
@@ -110,7 +110,7 @@ def _entry(tenant_id, service_id, agent_id, *, status="Waiting",
 
 
 def _read(entry_id):
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         return s.get(QueueEntry, entry_id)
 
 
@@ -120,47 +120,47 @@ def _read(entry_id):
 def test_agent_with_no_schedule_falls_back_to_tenant_hours():
     """The state every existing agent is in. Nothing may move for them."""
     t = _tenant(opens=8, closes=17); a = _agent(t.id)
-    assert main.get_working_windows(t, a, DATE) == [(at(8), at(17))]
+    assert queue_engine.get_working_windows(t, a, DATE) == [(at(8), at(17))]
 
 
 def test_agent_with_a_schedule_uses_it_instead_of_tenant_hours():
     t = _tenant(opens=8, closes=17); a = _agent(t.id)
     _schedule(t.id, a, SATURDAY, 9 * 60, 13 * 60)
-    assert main.get_working_windows(t, a, DATE) == [(at(9), at(13))]
+    assert queue_engine.get_working_windows(t, a, DATE) == [(at(9), at(13))]
 
 
 def test_agent_scheduled_on_other_days_only_is_off_today():
     """A schedule that exists but doesn't cover today means off, not fallback."""
     t = _tenant(); a = _agent(t.id)
     _schedule(t.id, a, MONDAY, 8 * 60, 17 * 60)
-    assert main.get_working_windows(t, a, DATE) == []
+    assert queue_engine.get_working_windows(t, a, DATE) == []
 
 
 def test_split_shift_is_two_windows_with_a_real_gap():
     t = _tenant(); a = _agent(t.id)
     _schedule(t.id, a, SATURDAY, 8 * 60, 12 * 60)
     _schedule(t.id, a, SATURDAY, 13 * 60, 17 * 60)
-    assert main.get_working_windows(t, a, DATE) == [(at(8), at(12)), (at(13), at(17))]
+    assert queue_engine.get_working_windows(t, a, DATE) == [(at(8), at(12)), (at(13), at(17))]
 
 
 def test_overlapping_windows_coalesce():
     t = _tenant(); a = _agent(t.id)
     _schedule(t.id, a, SATURDAY, 8 * 60, 12 * 60)
     _schedule(t.id, a, SATURDAY, 11 * 60, 15 * 60)
-    assert main.get_working_windows(t, a, DATE) == [(at(8), at(15))]
+    assert queue_engine.get_working_windows(t, a, DATE) == [(at(8), at(15))]
 
 
 def test_touching_windows_coalesce():
     t = _tenant(); a = _agent(t.id)
     _schedule(t.id, a, SATURDAY, 8 * 60, 12 * 60)
     _schedule(t.id, a, SATURDAY, 12 * 60, 17 * 60)
-    assert main.get_working_windows(t, a, DATE) == [(at(8), at(17))]
+    assert queue_engine.get_working_windows(t, a, DATE) == [(at(8), at(17))]
 
 
 def test_a_window_can_run_to_midnight():
     t = _tenant(); a = _agent(t.id)
     _schedule(t.id, a, SATURDAY, 18 * 60, 24 * 60)
-    assert main.get_working_windows(t, a, DATE) == [(at(18), at(0, 0, day=21))]
+    assert queue_engine.get_working_windows(t, a, DATE) == [(at(18), at(0, 0, day=21))]
 
 
 # ── blocks ───────────────────────────────────────────────────────────────────
@@ -168,51 +168,51 @@ def test_a_midday_block_splits_the_shift():
     """The lunch-break case."""
     t = _tenant(opens=8, closes=17); a = _agent(t.id)
     _block(t.id, a, at(13), at(14), "Lunch")
-    assert main.get_working_windows(t, a, DATE) == [(at(8), at(13)), (at(14), at(17))]
+    assert queue_engine.get_working_windows(t, a, DATE) == [(at(8), at(13)), (at(14), at(17))]
 
 
 def test_a_block_covering_the_whole_day_leaves_no_windows():
     t = _tenant(); a = _agent(t.id)
     _block(t.id, a, at(0), at(0, 0, day=21), "Leave")
-    assert main.get_working_windows(t, a, DATE) == []
+    assert queue_engine.get_working_windows(t, a, DATE) == []
 
 
 def test_a_block_clips_the_start_of_the_day():
     t = _tenant(opens=8, closes=17); a = _agent(t.id)
     _block(t.id, a, at(7), at(10), "Late in")
-    assert main.get_working_windows(t, a, DATE) == [(at(10), at(17))]
+    assert queue_engine.get_working_windows(t, a, DATE) == [(at(10), at(17))]
 
 
 def test_a_block_clips_the_end_of_the_day():
     t = _tenant(opens=8, closes=17); a = _agent(t.id)
     _block(t.id, a, at(15), at(23), "Early out")
-    assert main.get_working_windows(t, a, DATE) == [(at(8), at(15))]
+    assert queue_engine.get_working_windows(t, a, DATE) == [(at(8), at(15))]
 
 
 def test_an_overnight_block_only_removes_todays_part():
     t = _tenant(opens=8, closes=17); a = _agent(t.id)
     _block(t.id, a, at(16, 0, day=19), at(10, 0, day=20), "Overnight")
-    assert main.get_working_windows(t, a, DATE) == [(at(10), at(17))]
+    assert queue_engine.get_working_windows(t, a, DATE) == [(at(10), at(17))]
 
 
 def test_a_block_on_another_day_is_ignored():
     t = _tenant(opens=8, closes=17); a = _agent(t.id)
     _block(t.id, a, at(9, 0, day=21), at(12, 0, day=21), "Tomorrow")
-    assert main.get_working_windows(t, a, DATE) == [(at(8), at(17))]
+    assert queue_engine.get_working_windows(t, a, DATE) == [(at(8), at(17))]
 
 
 def test_blocks_apply_on_top_of_a_schedule_not_just_the_fallback():
     t = _tenant(); a = _agent(t.id)
     _schedule(t.id, a, SATURDAY, 9 * 60, 17 * 60)
     _block(t.id, a, at(12), at(13))
-    assert main.get_working_windows(t, a, DATE) == [(at(9), at(12)), (at(13), at(17))]
+    assert queue_engine.get_working_windows(t, a, DATE) == [(at(9), at(12)), (at(13), at(17))]
 
 
 def test_two_blocks_cut_two_holes():
     t = _tenant(opens=8, closes=17); a = _agent(t.id)
     _block(t.id, a, at(10), at(11))
     _block(t.id, a, at(14), at(15))
-    assert main.get_working_windows(t, a, DATE) == [
+    assert queue_engine.get_working_windows(t, a, DATE) == [
         (at(8), at(10)), (at(11), at(14)), (at(15), at(17))]
 
 
@@ -221,7 +221,7 @@ def test_one_agents_block_does_not_affect_another():
     a, b = _agent(t.id, name="A"), _agent(t.id, name="B")
     _block(t.id, a, at(12), at(13))
 
-    windows = main.get_working_windows_for([a, b], t, DATE)
+    windows = queue_engine.get_working_windows_for([a, b], t, DATE)
     assert windows[a] == [(at(8), at(12)), (at(13), at(17))]
     assert windows[b] == [(at(8), at(17))]
 
@@ -233,9 +233,9 @@ def test_windows_are_batched_flat_in_agent_count():
     agents = [_agent(t.id, name=f"A{i}") for i in range(6)]
 
     with count_queries() as one:
-        main.get_working_windows_for(agents[:1], t, DATE)
+        queue_engine.get_working_windows_for(agents[:1], t, DATE)
     with count_queries() as many:
-        main.get_working_windows_for(agents, t, DATE)
+        queue_engine.get_working_windows_for(agents, t, DATE)
 
     assert one["n"] == many["n"] <= 2, "\n".join(many["sql"])
 
@@ -244,36 +244,36 @@ def test_windows_are_batched_flat_in_agent_count():
 # place_in_windows
 # =============================================================================
 def test_place_returns_the_floor_when_it_already_sits_in_a_window():
-    assert main.place_in_windows([(at(8), at(17))], at(10), 60) == at(10)
+    assert queue_engine.place_in_windows([(at(8), at(17))], at(10), 60) == at(10)
 
 
 def test_place_jumps_forward_to_the_window_start():
-    assert main.place_in_windows([(at(9), at(17))], at(7), 60) == at(9)
+    assert queue_engine.place_in_windows([(at(9), at(17))], at(7), 60) == at(9)
 
 
 def test_place_skips_a_window_too_short_for_the_service():
     """60 minutes won't fit in the 30 left before lunch — start after it."""
     windows = [(at(8), at(12, 30)), (at(13), at(17))]
-    assert main.place_in_windows(windows, at(12), 60) == at(13)
+    assert queue_engine.place_in_windows(windows, at(12), 60) == at(13)
 
 
 def test_place_uses_the_tail_of_a_window_when_it_still_fits():
     windows = [(at(8), at(13)), (at(14), at(17))]
-    assert main.place_in_windows(windows, at(12), 60) == at(12)
+    assert queue_engine.place_in_windows(windows, at(12), 60) == at(12)
 
 
 def test_place_returns_none_when_the_day_is_over():
-    assert main.place_in_windows([(at(8), at(17))], at(16, 45), 60) is None
+    assert queue_engine.place_in_windows([(at(8), at(17))], at(16, 45), 60) is None
 
 
 def test_place_returns_none_with_no_windows():
-    assert main.place_in_windows([], at(10), 30) is None
+    assert queue_engine.place_in_windows([], at(10), 30) is None
 
 
 def test_place_will_not_run_a_service_through_a_block():
     """The whole point: a 60-min cut cannot start 30 min before lunch."""
     windows = [(at(8), at(13)), (at(14), at(17))]
-    assert main.place_in_windows(windows, at(12, 30), 60) == at(14)
+    assert queue_engine.place_in_windows(windows, at(12, 30), 60) == at(14)
 
 
 # =============================================================================
@@ -287,7 +287,7 @@ def test_assign_skips_an_agent_who_is_off_today(frozen_now):
     _schedule(t.id, off, MONDAY, 8 * 60, 17 * 60)     # never Saturday
     _entry(t.id, svc, on)                             # 'on' is the busy one
 
-    assert main.assign_agent(t, svc, None, DATE) == on
+    assert queue_engine.assign_agent(t, svc, None, DATE) == on
 
 
 def test_assign_skips_an_agent_blocked_out_for_the_whole_day(frozen_now):
@@ -297,14 +297,14 @@ def test_assign_skips_an_agent_blocked_out_for_the_whole_day(frozen_now):
     _block(t.id, away, at(0), at(0, 0, day=21), "Leave")
     _entry(t.id, svc, here)
 
-    assert main.assign_agent(t, svc, None, DATE) == here
+    assert queue_engine.assign_agent(t, svc, None, DATE) == here
 
 
 def test_assign_returns_none_when_nobody_is_working(frozen_now):
     t = _tenant(); svc = _service(t.id, 60)
     a = _agent(t.id, [svc])
     _schedule(t.id, a, SUNDAY, 8 * 60, 17 * 60)
-    assert main.assign_agent(t, svc, None, DATE) is None
+    assert queue_engine.assign_agent(t, svc, None, DATE) is None
 
 
 def test_assign_ignores_a_preference_for_an_agent_who_is_off(frozen_now):
@@ -314,7 +314,7 @@ def test_assign_ignores_a_preference_for_an_agent_who_is_off(frozen_now):
     open_ = _agent(t.id, [svc], "Open")
     _schedule(t.id, off, MONDAY, 8 * 60, 17 * 60)
 
-    assert main.assign_agent(t, svc, off, DATE) == open_
+    assert queue_engine.assign_agent(t, svc, off, DATE) == open_
 
 
 def test_assign_still_honours_a_preference_for_a_working_agent(frozen_now):
@@ -322,14 +322,14 @@ def test_assign_still_honours_a_preference_for_a_working_agent(frozen_now):
     busy = _agent(t.id, [svc], "Busy")
     _agent(t.id, [svc], "Free")
     _entry(t.id, svc, busy)
-    assert main.assign_agent(t, svc, busy, DATE) == busy
+    assert queue_engine.assign_agent(t, svc, busy, DATE) == busy
 
 
 def test_assign_is_unchanged_when_nobody_has_a_schedule(frozen_now):
     t = _tenant(); svc = _service(t.id, 60)
     busy, free = _agent(t.id, [svc], "Busy"), _agent(t.id, [svc], "Free")
     _entry(t.id, svc, busy)
-    assert main.assign_agent(t, svc, None, DATE) == free
+    assert queue_engine.assign_agent(t, svc, None, DATE) == free
 
 
 # =============================================================================
@@ -345,7 +345,7 @@ def test_recalc_pushes_a_booking_past_a_lunch_block(frozen_now):
     e3 = _entry(t.id, svc, a)                       # 12:00–13:00
     e4 = _entry(t.id, svc, a)                       # would be 13:00 -> 14:00
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
 
     assert _read(e1).estimated_start == at(10)
     assert _read(e2).estimated_start == at(11)
@@ -359,7 +359,7 @@ def test_recalc_starts_at_the_agents_shift_not_the_shop_opening(frozen_now):
     _schedule(t.id, a, SATURDAY, 14 * 60, 18 * 60)   # afternoon shift
     e1 = _entry(t.id, svc, a)
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
     assert _read(e1).estimated_start == at(14)
 
 
@@ -372,7 +372,7 @@ def test_recalc_short_service_fills_the_slot_before_a_block(frozen_now):
         _entry(t.id, svc, a)
     last = _entry(t.id, svc, a)                      # 12:30–13:00, exactly fits
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
     assert _read(last).estimated_start == at(12, 30)
 
 
@@ -388,7 +388,7 @@ def test_recalc_overflows_past_the_last_window_rather_than_dropping_anyone(froze
     e2 = _entry(t.id, svc, a)
     e3 = _entry(t.id, svc, a)                        # no room left
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
 
     assert _read(e1).estimated_start == at(10)
     assert _read(e2).estimated_start == at(11)
@@ -400,7 +400,7 @@ def test_recalc_is_unchanged_for_an_agent_with_no_schedule(frozen_now):
     a = _agent(t.id, [svc])
     e1, e2 = _entry(t.id, svc, a), _entry(t.id, svc, a)
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
     assert (_read(e1).estimated_start, _read(e2).estimated_start) == (at(10), at(11))
 
 
@@ -411,7 +411,7 @@ def test_recalc_respects_a_declared_arrival_that_lands_in_a_block(frozen_now):
     _block(t.id, a, at(13), at(14), "Lunch")
     e = _entry(t.id, svc, a, earliest_arrival=at(13, 15))
 
-    main.recalculate_queue(t.id, a, DATE)
+    queue_engine.recalculate_queue(t.id, a, DATE)
     assert _read(e).estimated_start == at(14)
 
 
@@ -422,25 +422,25 @@ def test_ces_snaps_a_quote_out_of_a_block(frozen_now):
     t = _tenant(opens=8, closes=17); a = _agent(t.id)
     _block(t.id, a, at(13), at(14), "Lunch")
     # 180 minutes of backlog from 10:00 would land at 13:00, inside lunch.
-    assert main.calculate_estimated_start(t, a, DATE, 180) == at(14)
+    assert queue_engine.calculate_estimated_start(t, a, DATE, 180) == at(14)
 
 
 def test_ces_snaps_forward_to_a_late_shift(frozen_now):
     t = _tenant(opens=8, closes=17); a = _agent(t.id)
     _schedule(t.id, a, SATURDAY, 15 * 60, 18 * 60)
-    assert main.calculate_estimated_start(t, a, DATE, 0) == at(15)
+    assert queue_engine.calculate_estimated_start(t, a, DATE, 0) == at(15)
 
 
 def test_ces_leaves_an_oversubscribed_quote_alone(frozen_now):
     """Past the last window there is nothing to snap to — say so, don't lie."""
     t = _tenant(opens=8, closes=17); a = _agent(t.id)
     _schedule(t.id, a, SATURDAY, 8 * 60, 12 * 60)
-    assert main.calculate_estimated_start(t, a, DATE, 600) == at(20)
+    assert queue_engine.calculate_estimated_start(t, a, DATE, 600) == at(20)
 
 
 def test_ces_unchanged_without_a_schedule(frozen_now):
     t = _tenant(opens=8, closes=17); a = _agent(t.id)
-    assert main.calculate_estimated_start(t, a, DATE, 90) == at(11, 30)
+    assert queue_engine.calculate_estimated_start(t, a, DATE, 90) == at(11, 30)
 
 
 # =============================================================================
@@ -456,7 +456,7 @@ def test_gapfill_will_not_slot_a_walk_in_into_a_block(frozen_now):
     _block(t.id, a, at(10), at(14, 45), "Out")
     _entry(t.id, svc, a, earliest_arrival=at(15), joined_at=at(9))
 
-    assert main.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is None
+    assert queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is None
 
 
 def test_gapfill_still_works_when_the_block_is_after_the_gap(frozen_now):
@@ -465,7 +465,7 @@ def test_gapfill_still_works_when_the_block_is_after_the_gap(frozen_now):
     _block(t.id, a, at(15), at(16), "Later")
     _entry(t.id, svc, a, earliest_arrival=at(14), joined_at=at(9))
 
-    assert main.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) == \
+    assert queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) == \
         at(9) - timedelta(seconds=1)
 
 
@@ -474,7 +474,7 @@ def test_gapfill_returns_none_when_the_agent_is_off(frozen_now):
     _schedule(t.id, a, MONDAY, 8 * 60, 17 * 60)
     _entry(t.id, svc, a, earliest_arrival=at(14), joined_at=at(9))
 
-    assert main.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is None
+    assert queue_engine.find_walkin_insert_joined_at(a, t.id, t, DATE, svc) is None
 
 
 # =============================================================================
@@ -519,11 +519,11 @@ def test_put_empty_schedule_restores_tenant_hours(client, hdr):
     r = client.put(f"/admin/agents/{a}/schedule", headers=hdr, json={"windows": []})
 
     assert r.json()["uses_tenant_hours"] is True
-    assert main.get_working_windows(_tenant_row(t.id), a, DATE) == [(at(8), at(17))]
+    assert queue_engine.get_working_windows(_tenant_row(t.id), a, DATE) == [(at(8), at(17))]
 
 
 def _tenant_row(tenant_id):
-    with Session(main.engine) as s:
+    with Session(db.engine) as s:
         return s.get(Tenant, tenant_id)
 
 
@@ -567,13 +567,13 @@ def test_put_schedule_is_atomic_on_a_bad_window(client, hdr):
 
 def test_setting_a_schedule_restates_todays_etas(client, hdr, monkeypatch):
     """A shift change has to move the customers already quoted the old one."""
-    today = main.today_str()
-    monkeypatch.setattr(main, "now",
+    today = core.today_str()
+    monkeypatch.setattr(core, "now",
                         lambda: datetime.strptime(today, "%Y-%m-%d").replace(hour=10))
     t = _tenant(opens=8, closes=17); svc = _service(t.id, 60)
     a = _agent(t.id, [svc])
     e = _entry(t.id, svc, a, date=today)
-    main.recalculate_queue(t.id, a, today)
+    queue_engine.recalculate_queue(t.id, a, today)
     assert _read(e).estimated_start.hour == 10
 
     weekday = datetime.strptime(today, "%Y-%m-%d").weekday()
@@ -593,11 +593,11 @@ def test_block_crud_round_trip(client, hdr):
 
     listed = client.get(f"/admin/agents/{a}/blocks?from_date={DATE}", headers=hdr)
     assert [b["id"] for b in listed.json()] == [block_id]
-    assert main.get_working_windows(_tenant_row(t.id), a, DATE) == \
+    assert queue_engine.get_working_windows(_tenant_row(t.id), a, DATE) == \
         [(at(8), at(13)), (at(14), at(17))]
 
     assert client.delete(f"/admin/blocks/{block_id}", headers=hdr).status_code == 200
-    assert main.get_working_windows(_tenant_row(t.id), a, DATE) == [(at(8), at(17))]
+    assert queue_engine.get_working_windows(_tenant_row(t.id), a, DATE) == [(at(8), at(17))]
 
 
 @pytest.mark.parametrize("body", [
