@@ -4,10 +4,18 @@
 
 | File | Purpose |
 |------|---------|
-| `main.py` | FastAPI bot — webhook + admin API |
+| `main.py` | Composition root — builds the FastAPI app, mounts routers, runs the scheduler |
+| `app/models.py` | Every database table |
+| `app/queue_engine.py` | Working windows, backlogs, ETAs, agent assignment |
+| `app/webhook.py` | The queue-booking WhatsApp conversation |
+| `app/orders.py` | Ordering: pricing, kitchen backlog, ready-time quotes |
+| `app/orders_flow.py` | The takeaway WhatsApp conversation |
+| `app/messaging.py` | Outbox table, delivery worker, menu builders |
+| `app/jobs.py` | Scheduled notifications and the midnight sweep |
+| `app/api/` | Admin routes, one module per area |
 | `tests/` | pytest suite — no Postgres or Redis needed |
 | `requirements.txt` | Python dependencies |
-| `Dockerfile.bot` | Docker image for the bot |
+| `Dockerfile.bot` | Docker image for the bot — copies `main.py` **and** `app/` |
 | `src/` | React admin frontend source |
 | `Dockerfile.frontend` | Docker image for the admin UI |
 | `nginx.conf` | SPA routing config for nginx |
@@ -45,7 +53,10 @@
    - `ALLOWED_ORIGINS` is comma-separated; set it to your admin URL in production instead of `*`.
 5. Deploy
 
-6. Once live, hit `POST https://your-bot-url/admin/seed` to insert your first tenant.
+6. Once live, log in to the admin frontend with your `SUPERADMIN_EMAIL` and
+   register your first business from **Businesses → + Add Business**. There is
+   no seed endpoint — tenants carry Evolution credentials, so they are created
+   through an authenticated route only.
 
 ---
 
@@ -71,7 +82,15 @@
    (or set the webhook URL plainly and add an `X-Webhook-Token` header — see
    [Webhook authentication](#webhook-authentication) below)
 2. In BookBot Admin → **Add Business** → fill in the form → Register
-3. Done — that business's customers can now book via WhatsApp.
+3. Under **What The Bot Does**, pick the mode:
+   - **Queue bookings** — salon, clinic, workshop. Services, agents, ETAs.
+   - **Takeaway orders** — kitchen, kota shop. Menu, cart, collection times.
+     See [Ordering](#ordering-takeaway-businesses).
+4. Done — that business's customers can now message it on WhatsApp.
+
+A business runs one mode or the other, and it can be switched later on the same
+form. Everything that existed before this shipped is a queue business and stays
+one until someone changes it.
 
 ---
 
@@ -82,7 +101,8 @@ Email + password logins, scoped per business:
 - **Super-admin (you):** seeded from `SUPERADMIN_EMAIL`/`SUPERADMIN_PASSWORD`.
   Sees every business, creates businesses, and provisions client logins.
 - **Tenant user (each client):** only sees and manages their **own** business —
-  queue, services, agents. Cannot see other tenants or the Businesses page.
+  queue, services and agents, or orders and menu, depending on the mode. Cannot
+  see other tenants or the Businesses page.
 
 Login flow: dashboard shows an email/password screen → `POST /auth/login`
 returns a JWT, stored in `localStorage` (never baked into the build) and sent as
@@ -135,6 +155,12 @@ pytest                       # runs unit + sqlite-backed integration tests
 
 No Postgres/Redis needed for the test suite (uses a temp SQLite DB; health-check
 redis errors are tolerated).
+
+### `tests/test_orders.py`
+Drives the whole takeaway conversation through the real `/webhook` endpoint with
+an in-process fake Redis, then covers pricing and price-snapshotting, the
+backlog maths at one pan versus four, cancellation rules, tenant isolation, the
+midnight sweep, and that a queue business still gets the queue bot.
 
 ### `tests/test_eta_characterization.py`
 Pins what the four ETA functions — `calculate_estimated_start`,
@@ -210,7 +236,11 @@ Every backlog, ETA-recalculation, gap-fill and next-waiter query filters exactly
 those columns, and the `(tenant_id, queue_date)` prefix also covers the
 dashboard's whole-day read. The rest cover party cancellation, the
 "already in the queue?" check, the 60s reconciler sweep, the outbox drain, and
-tenant/agent/service lookups. Full list: `INDEXES` in `main.py`.
+tenant/agent/service lookups. Full list: `INDEXES` in `app/db.py`.
+
+Ordering adds four: the kitchen board's `(tenant_id, order_date, status)`, the
+customer's "what did I order?" lookup, order lines by their order, and menu
+items by tenant.
 
 Index creation takes a brief write lock on PostgreSQL. At this data size that's
 milliseconds; if `queueentry` ever reaches millions of rows, switch to
@@ -358,6 +388,123 @@ intact.
 
 ---
 
+## Ordering (takeaway businesses)
+
+A business with `mode = "orders"` runs a different WhatsApp conversation: browse
+a menu, build a cart, place an order, chase it, cancel it. Nothing in the queue
+engine is involved — the two share the tenant, the Redis session store and the
+outbox, and nothing else.
+
+Dashboard: **Menu** and **Orders** appear in the sidebar for ordering
+businesses. A takeaway-only account lands on the kitchen board instead of a
+queue it doesn't have.
+
+### Why separate tables and not "a queue entry with items"
+
+A queue entry is one service, on one agent, at one time. An order is several
+items, in quantities, with money attached and nobody assigned. Bending one into
+the other would have put an "is this actually an order?" branch in every backlog,
+ETA and reporting query. `menu_item`, `customer_order` and `order_item` are their
+own tables. (`order` is a reserved word in SQL — hence `customer_order`, the same
+reason `User` is stored as `app_user`.)
+
+### The customer's conversation
+
+```
+hi           → main menu: place an order / my order / cancel
+1            → the menu, grouped by category, numbered
+3            → picks item 3 → "How many Full House?"
+2            → adds two, shows the cart and a running total
+2            → checkout → "Any special request?"
+no chilli    → confirm screen with the total and a collection time
+yes          → order placed, with a #code and a ready time
+```
+
+`0` goes back a step from anywhere. Session state lives in Redis under `ord_*`
+keys, prefixed so a business that switches modes mid-conversation can never land
+a cart in a queue state.
+
+### Money
+
+Cents, everywhere, converted only at the UI edge. Order lines snapshot the
+item's **name, price and prep time at the moment of placement**. Reprice a kota
+tonight and this morning's takings are unchanged; delete an item and its
+history still reads correctly. This is the single most important thing to
+preserve if you extend the schema.
+
+### Ready times
+
+```
+ready_at = now + (committed prep minutes ÷ kitchen_parallel_items) + this order's slowest item
+```
+
+`kitchen_parallel_items` (default 4, per business, on the tenant form) is how
+many items the kitchen genuinely cooks at once. A four-pan kitchen quoting the
+raw sum of everything outstanding tells every customer to come back an hour
+late, and they stop believing the quote — so the backlog is divided by
+throughput. Set it to 1 for a single fryer and the whole queue is quoted.
+
+Items within one order are assumed to come off together: a burger and a Coke go
+into one bag, so the Coke finishing sooner isn't something the customer
+experiences.
+
+### Statuses
+
+| Status | Meaning | Who moves it |
+|---|---|---|
+| `Placed` | received, kitchen hasn't started | — |
+| `Preparing` | being made | staff, on the board |
+| `Ready` | on the pass — **customer is messaged automatically** | staff |
+| `Collected` | handed over and paid for | staff |
+| `Cancelled` | not happening | staff, or the customer while still `Placed` |
+
+**A customer can only cancel while `Placed`.** Once the kitchen has started,
+real food exists and writing it off is a counter decision, not a WhatsApp one —
+the bot says so and points them at the till.
+
+The "your order is ready" message carries `dedupe_key = order_ready:{id}`, so a
+double-tap, or a bounce back through `Preparing` and forward again, never shouts
+at the same customer twice.
+
+### Payment
+
+**Cash at the counter on collection.** There is no online payment and no
+delivery. `Collected` is what books an order as money taken — the board's
+`takings_cents` counts collected orders only, never open or cancelled ones.
+
+### The midnight sweep
+
+`midnight_reset_job` cancels yesterday's `Placed`, `Preparing` and `Ready`
+orders with `closed_by = "system"` — the same provenance rule the queue uses
+(see [The no-show trap](#the-no-show-trap)). It never marks them `Collected`,
+which would book money as taken for food that may still be sitting on the pass.
+
+### API
+
+| Route | Purpose |
+|---|---|
+| `GET /admin/menu/{tenant_id}` | full menu **including sold-out items** — staff need to see them to switch them back on |
+| `POST /admin/menu` | `{"tenant_id":1,"name":"Kota","price_cents":4500,"prep_minutes":12,"category":"Kotas"}` |
+| `PATCH /admin/menu/{item_id}` | edit; `is_active:false` = sold out |
+| `DELETE /admin/menu/{item_id}` | remove for good — past orders keep their own copy |
+| `GET /admin/orders/{tenant_id}?order_date=` | the kitchen board, plus a summary and takings |
+| `PATCH /admin/orders/{order_id}/status` | `{"status":"Ready"}` — sends the ready message |
+| `POST /admin/orders` | counter order; a `customer_phone` gets the same ready message |
+
+`sort_order` controls display order **and** which category leads: the category
+containing the lowest `sort_order` comes first. Otherwise "Drinks" would sit
+above "Kotas" at a kota shop purely because D precedes K.
+
+### Migration
+
+`menu_item`, `customer_order` and `order_item` are created by `create_all()` on
+first boot after upgrade, and `ensure_indexes()` adds their four indexes.
+`mode`, `currency_symbol` and `kitchen_parallel_items` are added to the existing
+`tenant` table by `TENANT_COLUMNS` in `create_db_and_tables()`, defaulting to
+`queue` / `R` / `4`. No backfill, and no existing business changes behaviour.
+
+---
+
 ## Booking lock
 
 Agent assignment is read-then-write: `assign_agent` measures every agent's
@@ -409,4 +556,15 @@ them.
   status change, so a duplicate is transient; the agent choice is not.
 - **Legacy data:** family bookings created before the party-linkage fix may not
   fully cancel as one. New bookings are fine.
+- **Ordering takes no payment.** Cash at the counter on collection. There is no
+  payment gateway, so nothing reconciles what was charged against what was
+  ordered, and no delivery — collection only.
+- **Order placement isn't locked.** Unlike queue bookings there is no
+  `booking_lock` around it, because nothing is being assigned: two orders
+  landing together each get their own row and their own quote. The second may be
+  quoted a ready time that doesn't count the first, so a genuine burst can quote
+  slightly optimistically.
+- **Order codes are the last three digits of the id.** Unique within a day well
+  past any realistic volume, and the board is per-day, so wrap-around isn't
+  visible — but it is not a guarantee.
 
