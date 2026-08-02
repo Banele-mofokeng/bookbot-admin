@@ -5,6 +5,7 @@
 | File | Purpose |
 |------|---------|
 | `main.py` | FastAPI bot — webhook + admin API |
+| `tests/` | pytest suite — no Postgres or Redis needed |
 | `requirements.txt` | Python dependencies |
 | `Dockerfile.bot` | Docker image for the bot |
 | `src/` | React admin frontend source |
@@ -25,12 +26,20 @@
    DATABASE_URL=postgres://postgres:<password>@<project>_booking-db:5432/whatsapp_bot
    REDIS_URL=redis://default:<password>@<project>_evolution-api-redis:6379
    JWT_SECRET=<long-random-secret>           # REQUIRED — signs login tokens
+   WEBHOOK_SECRET=<long-random-secret>       # REQUIRED — authenticates Evolution's /webhook calls
    SUPERADMIN_EMAIL=you@example.com          # your platform-operator login (seeded on boot)
    SUPERADMIN_PASSWORD=<strong-password>     # change after first login
    ALLOWED_ORIGINS=https://your-admin-url.easypanel.host   # CORS allow-list (defaults to *)
    TZ=Africa/Johannesburg
    ```
    - `JWT_SECRET` **must be set** or auth returns `503`. Generate one e.g. `openssl rand -hex 32`.
+   - `WEBHOOK_SECRET` **must be set.** If it is empty the bot still boots and takes
+     bookings — so an existing deployment doesn't go silent on upgrade — but
+     `/webhook` is then completely open: the tenant is resolved from the request
+     body, and a business WhatsApp number is public, so anyone who finds the URL
+     can forge bookings, cancel real customers' spots, and burn Evolution credits.
+     Startup prints a warning and `GET /health` reports `"webhook_auth": false`
+     until it's set. Use a different value from `JWT_SECRET`.
    - `SUPERADMIN_EMAIL`/`SUPERADMIN_PASSWORD` seed your super-admin account on startup
      (only if it doesn't already exist). Without them, no one can log in.
    - `ALLOWED_ORIGINS` is comma-separated; set it to your admin URL in production instead of `*`.
@@ -57,7 +66,10 @@
 
 ## Adding a new business tenant
 
-1. In Evolution API Manager → create a new instance → scan QR → set webhook to `https://your-bot-url/webhook`
+1. In Evolution API Manager → create a new instance → scan QR → set webhook to
+   `https://your-bot-url/webhook?token=<WEBHOOK_SECRET>`
+   (or set the webhook URL plainly and add an `X-Webhook-Token` header — see
+   [Webhook authentication](#webhook-authentication) below)
 2. In BookBot Admin → **Add Business** → fill in the form → Register
 3. Done — that business's customers can now book via WhatsApp.
 
@@ -85,7 +97,32 @@ expire after `JWT_EXP_HOURS` (default 12).
    (`PATCH /admin/users/{id}`).
 
 Every `/admin/*` route is authenticated and tenant-scoped server-side, so the
-isolation holds even if the UI is bypassed. `/health` and `/webhook` stay public.
+isolation holds even if the UI is bypassed. `/health` stays public.
+
+---
+
+## Webhook authentication
+
+`/webhook` requires the `WEBHOOK_SECRET` shared secret on every call. It is
+accepted three ways, whichever your Evolution version can be configured to send:
+
+| How | Where to set it |
+|-----|-----------------|
+| `?token=<secret>` on the URL | Evolution instance → webhook URL. **Always works** — the URL is always editable. |
+| `X-Webhook-Token: <secret>` | Evolution instance → webhook custom headers (v2+). |
+| `Authorization: Bearer <secret>` | Same, if you prefer the standard header. |
+
+Anything else gets `401`. Check it's on with `curl https://your-bot-url/health`
+→ `"webhook_auth": true`.
+
+### Rotating the secret (no downtime)
+`WEBHOOK_SECRET` is comma-separated and every value is accepted, so:
+
+1. Set `WEBHOOK_SECRET=<old>,<new>` and redeploy.
+2. Repoint every Evolution instance at `<new>`.
+3. Set `WEBHOOK_SECRET=<new>` and redeploy.
+
+Skipping step 1 means bookings 401 until every instance is repointed.
 
 ---
 
@@ -99,16 +136,277 @@ pytest                       # runs unit + sqlite-backed integration tests
 No Postgres/Redis needed for the test suite (uses a temp SQLite DB; health-check
 redis errors are tolerated).
 
+### `tests/test_eta_characterization.py`
+Pins what the four ETA functions — `calculate_estimated_start`,
+`get_agent_backlog_minutes`, `recalculate_queue`,
+`find_walkin_insert_joined_at` — do **today**, to the minute, against a frozen
+clock. They are not a specification; they exist so that changing the scheduling
+model can't alter behaviour silently.
+
+Behaviour that is arguably wrong is pinned anyway and tagged `QUIRK:` in the
+docstring — a single late booking reading as hours of backlog, an idle gap never
+being filled by the customer behind it, a deleted service counting as 0 minutes
+in one function and 60 in another. **A `QUIRK` test failing during a scheduling
+change is expected**: read it, decide whether the new behaviour is the fix,
+update the pin deliberately. Any other failure is a regression.
+
+Per-agent working hours went in against these pins and every one held — the
+no-schedule fallback reproduces the old behaviour exactly. Only the two
+closing-time QUIRKs were rewritten, and only to narrow them: a quote now snaps
+into a real working window, and what survives is the overflow case where the
+day is oversubscribed and there is nothing to snap to.
+
+Verified by mutation: six deliberate breakages of the engine (dropping the
+now() anchor, dropping the duration floor, flipping the gap-fill boundary from
+`<=` to `<`, ignoring `earliest_arrival`, re-timing `InService`, treating
+`InService` as full duration) each fail between 2 and 6 of these tests.
+
+---
+
+## Message delivery & notifications
+
+Outbound WhatsApp messages are **not** sent inline. `send_text` writes a row to
+the `outbox_message` table and returns; a background worker drains it. So a
+webhook reply never waits on Evolution, and a send that fails is retried rather
+than silently lost.
+
+- Retries use exponential backoff (5s, 10s, 20s, 40s, 80s), capped at 5 minutes,
+  giving up after `OUTBOX_MAX_ATTEMPTS` (5) and marking the row `Failed`.
+- Messages go out **in queue order, one at a time** — consecutive bot replies
+  must arrive in the order they were written. A failing message is deferred and
+  the worker moves on, so one unreachable tenant can't block the rest.
+- Notifications that must not duplicate (`you're next`, the 15-minute warning)
+  carry a `dedupe_key` and are claimed with a conditional UPDATE first.
+
+**The 15-minute warning is derived from queue state, not scheduled.** Every
+`RECONCILE_SECONDS` (60) the reconciler looks at who is currently `InService`
+and warns the next waiter if that service is within 15 minutes of finishing.
+Nothing is persisted as a timer, so a restart or crash can't lose a warning —
+worst case it goes out one tick late. `"You're up next"` still fires
+immediately when staff mark someone Done/NoShow/Cancelled.
+
+### Monitoring
+`GET /health` reports `outbox_pending` and `outbox_failed`. Pending should sit
+near zero; a climbing number means Evolution is unreachable, and any `failed`
+count is a message that never reached a customer. Both are worth alerting on.
+
+---
+
+## Database indexes
+
+`ensure_indexes()` runs on every boot and creates the hot-path indexes with
+`CREATE INDEX IF NOT EXISTS`, so both fresh and existing databases get them —
+`create_all()` alone only indexes tables it creates, which is never the case on
+an already-deployed instance.
+
+`agent_schedule` and `agent_block` are new tables; `create_all()` adds them on
+first boot after upgrade, and `ensure_indexes()` adds their two indexes. No
+backfill is needed — an agent with no schedule rows falls back to the tenant's
+opening hours (see [Agent working hours](#agent-working-hours)).
+
+The one that matters most is
+`ix_queueentry_tenant_date_agent_status (tenant_id, queue_date, agent_id, status)`.
+Every backlog, ETA-recalculation, gap-fill and next-waiter query filters exactly
+those columns, and the `(tenant_id, queue_date)` prefix also covers the
+dashboard's whole-day read. The rest cover party cancellation, the
+"already in the queue?" check, the 60s reconciler sweep, the outbox drain, and
+tenant/agent/service lookups. Full list: `INDEXES` in `main.py`.
+
+Index creation takes a brief write lock on PostgreSQL. At this data size that's
+milliseconds; if `queueentry` ever reaches millions of rows, switch to
+`CREATE INDEX CONCURRENTLY` (which cannot run inside a transaction block).
+
+`tests/test_indexes.py` asserts each index exists **and** that the planner
+actually chooses it for the real query shapes — an index the planner ignores
+because of column order would otherwise pass silently.
+
+---
+
+## Query cost
+
+The queue engine used to fetch each entry's service with its own round trip,
+and `assign_agent` opened a fresh database session per candidate agent. Answers
+were correct, they were just paid for per row. Measured on 6 agents / 48
+entries:
+
+| Call | Before | After |
+|------|--------|-------|
+| `assign_agent` | 57 | 6 |
+| `get_queue` (dashboard poll) | 97 | 4 |
+| `recalculate_queue` | 51 selects | 4 selects |
+| `get_agent_backlog_minutes` | 9 | 2 |
+| `find_walkin_insert_joined_at` | 10 | 2 |
+
+`get_agent_backlogs_minutes(agent_ids, …)` answers "who is free soonest?" for
+every candidate in two queries; `assign_agent` uses it. `tests/test_concurrency.py`
+asserts the counts do not grow with the number of rows or agents, which is what
+fails if an N+1 creeps back — a plain correctness test would stay green.
+
+---
+
+## Reports
+
+`GET /admin/analytics/{tenant_id}?from_date=&to_date=` (default: last 30 days,
+max 366). Dashboard: **Reports** in the sidebar.
+
+Volume, completion, busiest hours and weekdays, per-agent workload, service mix,
+and measured wait/service times.
+
+### The no-show trap
+
+`midnight_reset_job` closes anything staff left open as `NoShow`. Counted
+naively, **a shop that forgets to tap Done looks like a shop whose customers
+don't turn up** — the report would measure staff habits while claiming to
+measure customers.
+
+So `queueentry.closed_by` records who closed each entry:
+
+| Value | Set by | Counted as |
+|---|---|---|
+| `staff` | dashboard status change | a real no-show / cancellation |
+| `customer` | WhatsApp cancellation | customer-initiated cancel |
+| `system` | the midnight sweep | **`unclosed`** — a data-quality number, never a no-show |
+| `""` | rows written before this shipped | `no_shows_untracked` |
+
+Two consequences worth knowing before you read a number:
+
+- **The no-show rate is `null` for any range containing untracked rows.** A rate
+  computed over them would read low and look authoritative. The response carries
+  `rates.no_show_note` explaining why, and the dashboard shows it instead of a
+  figure. It starts reporting once the range contains only rows closed after
+  the upgrade.
+- **Rates are over closed entries only.** Including a queue that is still
+  running would make completion fall through the morning and recover by closing
+  time, meaning nothing. `still_open` is reported separately.
+
+### Measured vs estimated
+
+`started_at` and `finished_at` are written when staff move an entry to
+InService and to a terminal status. Nothing recorded these before — 
+`estimated_start` is a forecast that recalculation overwrites — so **real wait
+and service times only exist from this upgrade onwards**. With no samples the
+response says `available: false` rather than showing a zero that reads like a
+measurement. `minutes_booked` in the service mix is scheduled duration from each
+service's configured length, labelled as such in the UI.
+
+`p90` is nearest-rank: "9 in 10 customers were seen within this". Nine 5-minute
+waits and one 120 gives a p90 of 5, not 120 — one bad morning must not read as
+a staffing problem.
+
+### Migration
+`closed_by`, `started_at` and `finished_at` are added to `queueentry` by
+`QUEUEENTRY_COLUMNS` in `create_db_and_tables()` on boot. Existing rows keep
+`closed_by = ''` and are reported as untracked. No backfill — inventing
+provenance for old rows is exactly the error this design exists to avoid.
+
+---
+
+## Agent working hours
+
+Each agent has a recurring weekly pattern (`agent_schedule`) plus one-off
+unavailable windows (`agent_block`) that cut holes in it. The queue engine
+places every booking inside the resulting **working windows** — ETAs, backlog
+placement, gap-fill and assignment all respect them.
+
+Set them in the dashboard: **Agents → Hours** on any agent row.
+
+### The fallback that keeps existing shops unchanged
+
+| Agent's schedule rows | Result |
+|---|---|
+| none at all | the tenant's `queue_opens`–`queue_closes`, **every day** |
+| some, including today's weekday | exactly those windows |
+| some, none for today's weekday | not working today |
+
+Every agent starts in the first row, so **nothing moves on deploy**. Hours only
+change for an agent once someone sets a schedule for them. Saving an empty
+schedule puts them back on shop hours.
+
+Two rows for the same weekday make a split shift — 08:00–12:00 and 13:00–17:00
+means the hour between is not worked. Overlapping rows coalesce.
+
+### Rules the engine applies
+- **A service must fit in one contiguous window.** A 60-minute cut cannot start
+  at 12:30 when lunch begins at 13:00. A 30-minute one can.
+- **An agent not working that date is never assigned** — including when the
+  customer asks for them by name. Without this an agent on leave has an empty
+  queue, therefore zero backlog, therefore wins every assignment.
+- **Blocks beat the schedule.** A block spanning midnight only removes that
+  day's portion.
+- **An oversubscribed day still gives everyone a time.** When nothing fits, the
+  old back-to-back arithmetic stands and the ETA reads after hours. That is
+  honest — nobody can serve them inside the schedule — and no booking is lost.
+- Setting a schedule, or adding/removing a block, immediately re-runs
+  `recalculate_queue` for the affected day, so customers already quoted the old
+  hours get restated times rather than ones nobody will honour.
+
+### API
+| Route | Purpose |
+|---|---|
+| `GET /admin/agents/{id}/schedule` | weekly windows; `uses_tenant_hours` flags the fallback |
+| `PUT /admin/agents/{id}/schedule` | replace all — `{"windows":[{"weekday":0,"start_minute":480,"end_minute":1020}]}` |
+| `GET /admin/agents/{id}/blocks?from_date=` | upcoming time off |
+| `POST /admin/agents/{id}/blocks` | `{"starts_at":ISO,"ends_at":ISO,"reason":""}` |
+| `DELETE /admin/blocks/{id}` | remove one |
+| `GET /admin/agents/{id}/windows?queue_date=` | **the windows the engine actually uses** — the honest answer to "why was nobody booked at 14:00?" |
+
+`weekday` is 0 = Monday … 6 = Sunday (Python's `datetime.weekday()`). Times are
+minutes from midnight, 0–1440. `PUT` is replace-all rather than per-row because
+a half-applied schedule would silently take a working day off the board; an
+invalid window rejects the whole request and leaves the existing schedule
+intact.
+
+---
+
+## Booking lock
+
+Agent assignment is read-then-write: `assign_agent` measures every agent's
+backlog, then the caller inserts a row that changes those backlogs. Two
+bookings landing inside that window both see the pre-insert state and pick the
+same agent. `booking_lock(tenant_id, queue_date)` — a Redis lock scoped per
+business per day — serialises assignment and insert on both paths, WhatsApp
+(`_do_assign`) and dashboard walk-in (`add_walkin`). Two businesses, or the
+same business on two dates, never wait on each other.
+
+The WhatsApp flow picks an agent *before* asking for arrival time, so by the
+time the customer replies the pick is a round trip stale. If they never named
+an agent, `_do_assign` re-resolves under the lock. That can only find an agent
+whose backlog is ≤ the one already quoted, so the ETA the customer was shown
+still holds. An explicitly requested agent is never overridden.
+
+**It degrades open.** If Redis is unreachable, or the lock is still held after
+`BOOKING_LOCK_WAIT` (2s), the booking proceeds unlocked — exactly the behaviour
+before the lock existed. Dropping a real booking is worse than a rare double
+assignment, which staff can see and fix on the dashboard. The wait is capped
+short on purpose: `handle_webhook` is async and calls into this synchronously,
+so a long spin would stall the event loop and the outbox drain with it. Normal
+hold time is a few writes.
+
+`BOOKING_LOCK_TTL` (15s) is the safety net for a process that dies mid-booking.
+Release is compare-and-delete against the holder's own token, so a lock whose
+TTL lapsed and was re-taken by someone else is never released out from under
+them.
+
 ---
 
 ## Known limitations (not yet hardened)
 
-- **WhatsApp send is synchronous** (`requests`) inside the async webhook, so
-  concurrent webhooks serialise. Fine at small-business volume; move to a
-  background task / async client if throughput grows.
-- **No per-customer concurrency lock.** Duplicate *retries* are dropped via
-  message-id idempotency, but two genuinely simultaneous messages from one
-  customer are not serialised.
+- **Single-process assumption.** `Dockerfile.bot` runs one uvicorn worker. Adding
+  `--workers` would run one scheduler and one outbox worker *per process*, which
+  means duplicate reconciler ticks and concurrent outbox drains. The `dedupe_key`
+  and conditional-UPDATE claim prevent duplicate *notifications*, but ordinary
+  replies could be sent twice and out of order. Scale by adding a lock or moving
+  the worker out of the web process first.
+- **No webhook rate limit.** `WEBHOOK_SECRET` stops unauthenticated callers, but
+  a holder of the secret (or a compromised Evolution instance) is not throttled.
+- **No per-customer concurrency lock.** Bookings are serialised per tenant per
+  day (see [Booking lock](#booking-lock)), and duplicate *retries* are dropped
+  via message-id idempotency — but two genuinely simultaneous messages from the
+  same customer still run their conversation steps concurrently.
+- **The booking lock is advisory, not a database constraint.** It degrades open
+  when Redis is down, and nothing at the schema level stops two rows taking the
+  same position. Positions are re-derived by `recalculate_queue` on the next
+  status change, so a duplicate is transient; the agent choice is not.
 - **Legacy data:** family bookings created before the party-linkage fix may not
   fully cancel as one. New bookings are fine.
 

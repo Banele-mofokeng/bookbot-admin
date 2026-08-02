@@ -4,6 +4,7 @@ import Sidebar from './components/Sidebar.jsx'
 import Queue from './pages/queue/Queue.jsx'
 import Services from './pages/services/Services.jsx'
 import Agents from './pages/agents/Agents.jsx'
+import Reports from './pages/reports/Reports.jsx'
 import Tenants from './pages/Tenants.jsx'
 import TenantForm from './pages/TenantForm.jsx'
 import { api, login as apiLogin, getMe, getToken, clearToken, setUnauthorizedHandler } from './api/client.js'
@@ -12,6 +13,7 @@ const PAGE_TITLES = {
   '/':                     'Queue',
   '/services':             'Services',
   '/agents':               'Agents',
+  '/reports':              'Reports',
   '/admin/businesses':     'Businesses',
 }
 
@@ -150,6 +152,7 @@ export default function App() {
             <Route path="/"                    element={<Queue      tenants={tenants} />} />
             <Route path="/services"            element={<Services   tenants={tenants} />} />
             <Route path="/agents"              element={<Agents     tenants={tenants} />} />
+            <Route path="/reports"             element={<Reports    tenants={tenants} />} />
             {/* Business + user management is super-admin only */}
             <Route path="/admin/businesses"          element={isSuper ? <Tenants    tenants={tenants} reload={loadTenants} /> : <Navigate to="/" replace />} />
             <Route path="/admin/businesses/new"      element={isSuper ? <TenantForm tenants={tenants} reload={loadTenants} /> : <Navigate to="/" replace />} />

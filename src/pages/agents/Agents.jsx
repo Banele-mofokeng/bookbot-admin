@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { api } from '../../api/client.js'
 import { Badge, Button, Card, Empty, Loading, Input, useToast, Toast } from '../../components/UI.jsx'
+import AgentHours from './AgentHours.jsx'
 
 function AgentForm({ tenantId, agent, services, onSave, onCancel }) {
   const [name, setName]               = useState(agent?.name || '')
@@ -69,6 +70,7 @@ export default function Agents({ tenants }) {
   const [loading, setLoading]   = useState(false)
   const [adding, setAdding]     = useState(false)
   const [editing, setEditing]   = useState(null)
+  const [hoursFor, setHoursFor] = useState(null)
   const { toast, show }         = useToast()
 
   async function load(id) {
@@ -141,6 +143,9 @@ export default function Agents({ tenants }) {
               <AgentForm key={agent.id} tenantId={selectedTenantId} agent={agent} services={services}
                 onSave={() => { load(selectedTenantId); setEditing(null); show('Updated.', 'success') }}
                 onCancel={() => setEditing(null)} />
+            ) : hoursFor === agent.id ? (
+              <AgentHours key={agent.id} agent={agent} tenant={tenant}
+                onClose={() => setHoursFor(null)} />
             ) : (
               <Card key={agent.id} className="animate-fade-up" style={{ padding: '16px 20px', animationDelay: `${i * 40}ms` }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -164,7 +169,8 @@ export default function Agents({ tenants }) {
                   </div>
                   <div className="card-row-actions">
                     <Badge color={agent.is_active ? 'green' : 'gray'}>{agent.is_active ? 'Active' : 'Inactive'}</Badge>
-                    <Button variant="ghost" size="sm" onClick={() => setEditing(agent.id)}>Edit</Button>
+                    <Button variant="ghost" size="sm" onClick={() => { setHoursFor(agent.id); setEditing(null) }}>Hours</Button>
+                    <Button variant="ghost" size="sm" onClick={() => { setEditing(agent.id); setHoursFor(null) }}>Edit</Button>
                     <Button variant={agent.is_active ? 'danger' : 'outline'} size="sm" onClick={() => toggleActive(agent)}>
                       {agent.is_active ? 'Deactivate' : 'Activate'}
                     </Button>
