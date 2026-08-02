@@ -19,6 +19,20 @@ const NAV = [
   },
 ]
 
+// Shown only to businesses running the takeaway bot. A salon has no menu, and
+// a kota shop has no agents to schedule — showing both to everyone would make
+// half the nav dead weight for every user.
+const ORDERS_NAV = [
+  {
+    to: '/orders', label: 'Orders',
+    icon: <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 5h10l-1 8H4L3 5z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round"/><path d="M6 5V3.5a2 2 0 014 0V5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+  },
+  {
+    to: '/menu', label: 'Menu',
+    icon: <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="3" y="2" width="10" height="12" rx="1.5" stroke="currentColor" strokeWidth="1.3"/><path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+  },
+]
+
 const SUPER_NAV = [
   {
     to: '/admin/businesses', label: 'Businesses',
@@ -26,8 +40,18 @@ const SUPER_NAV = [
   },
 ]
 
-export default function Sidebar({ isOpen, onClose, onLogout, isSuper }) {
-  const navItems = isSuper ? [...NAV, ...SUPER_NAV] : NAV
+export default function Sidebar({ isOpen, onClose, onLogout, isSuper, tenants = [] }) {
+  // A super-admin sees whatever their portfolio needs; a client sees only what
+  // their own business runs. Before any tenant loads, fall back to the queue
+  // nav — that is what every existing deployment is.
+  const hasOrders = tenants.some(t => t.mode === 'orders')
+  const hasQueue  = tenants.some(t => t.mode !== 'orders') || tenants.length === 0
+
+  const navItems = [
+    ...(hasQueue ? NAV : []),
+    ...(hasOrders ? ORDERS_NAV : []),
+    ...(isSuper ? SUPER_NAV : []),
+  ]
   return (
     <>
       {/* Dark overlay — only visible on mobile when open */}

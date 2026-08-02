@@ -7,7 +7,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Request, Depends
 from sqlmodel import Session, select
 
-from app import config, core
+from app import config, core, orders_flow
 from app.auth import verify_webhook_secret
 from app.core import format_duration, format_eta, normalize_number
 from app.db import engine
@@ -277,6 +277,13 @@ async def handle_webhook(request: Request):
     state = sess.get("state", "idle")
 
     print(f"\U0001f4e9 [{tenant.business_name}] {customer_num} | {state} | \'{text}\'")
+
+    # A tenant runs one conversation or the other. Everything above this line —
+    # idempotency, tenant resolution, session load — is shared; everything
+    # below is the queue booking flow and does not apply to a takeaway.
+    if tenant.mode == "orders":
+        return orders_flow.handle_message(
+            tenant, customer_num, customer_name, raw_text, text, sess, state)
 
     # ── GLOBAL TRIGGERS (work from any state) ─────────────────────────────
     if any(w in text for w in ["menu","start","hi","hello","hey"]) and state not in ["awaiting_booking_for", "awaiting_children", "awaiting_children_names", "awaiting_arrival_time"]:

@@ -6,7 +6,7 @@ from sqlmodel import Session, select
 from app import core
 from app.core import format_eta, normalize_number
 from app.db import engine
-from app.models import Tenant, Service, Agent, QueueEntry
+from app.models import Tenant, Service, Agent, Order, QueueEntry
 from app.messaging import send_text
 
 # =============================================================================
@@ -151,9 +151,27 @@ def _fire_youre_next(tenant_id: int, agent_id: int, queue_date: str):
     send_text(tenant, notify_to, body, dedupe_key=f"youre_next:{entry_id}")
 
 async def midnight_reset_job():
-    """Runs at 00:01 every night. Closes out yesterday's queue."""
+    """Runs at 00:01 every night. Closes out yesterday's queue and orders."""
     print("🌙 Running midnight reset...")
     yesterday = core.yesterday_str()
+
+    with Session(engine) as s:
+        # Orders nobody closed. Never auto-Collected: that would book money as
+        # taken for food that may still be sitting on the pass. Cancelled and
+        # tagged as ours, so takings and reporting stay honest about what
+        # actually got sold.
+        stale_orders = s.exec(
+            select(Order).where(
+                Order.order_date == yesterday,
+                Order.status.in_(["Placed", "Preparing", "Ready"]),
+            )
+        ).all()
+        for order in stale_orders:
+            order.status      = "Cancelled"
+            order.closed_by   = "system"
+            order.finished_at = core.now()
+            s.add(order)
+        s.commit()
 
     with Session(engine) as s:
         leftover = s.exec(
@@ -175,5 +193,6 @@ async def midnight_reset_job():
             s.add(entry)
 
         s.commit()
-    print(f"🌙 Reset complete. {len(leftover)} entries closed.")
+    print(f"🌙 Reset complete. {len(leftover)} entries and "
+          f"{len(stale_orders)} orders closed.")
 

@@ -29,6 +29,11 @@ class TenantCreate(SQLModel):
     queue_closes:       int  = 17
     advance_days:       int  = 1
     is_active:          bool = True
+    # Which bot this business runs. Defaults to the queue so an existing
+    # onboarding form that doesn't send this keeps creating queue tenants.
+    mode:                   str = "queue"
+    currency_symbol:        str = "R"
+    kitchen_parallel_items: int = 4
 
 
 @router.get("/admin/tenants")
@@ -40,8 +45,14 @@ def list_tenants(user: User = Depends(get_current_user)):
         t = s.get(Tenant, user.tenant_id) if user.tenant_id else None
         return [t] if t else []
 
+MODES = ["queue", "orders"]
+
+
 @router.post("/admin/tenants")
 def create_tenant(data: TenantCreate, _: User = Depends(require_super)):
+    if data.mode not in MODES:
+        raise HTTPException(status_code=400,
+                            detail=f"mode must be one of {', '.join(MODES)}")
     tenant = Tenant(**data.dict())
     with Session(engine) as s:
         s.add(tenant)
@@ -58,6 +69,9 @@ def update_tenant(tenant_id: int, updates: Dict[str, Any],
         tenant = s.get(Tenant, tenant_id)
         if not tenant:
             raise HTTPException(status_code=404, detail="Tenant not found")
+        if "mode" in updates and updates["mode"] not in MODES:
+            raise HTTPException(status_code=400,
+                                detail=f"mode must be one of {', '.join(MODES)}")
         for k, v in updates.items():
             if hasattr(tenant, k):
                 setattr(tenant, k, v)

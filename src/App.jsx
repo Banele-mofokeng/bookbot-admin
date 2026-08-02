@@ -5,6 +5,8 @@ import Queue from './pages/queue/Queue.jsx'
 import Services from './pages/services/Services.jsx'
 import Agents from './pages/agents/Agents.jsx'
 import Reports from './pages/reports/Reports.jsx'
+import Orders from './pages/orders/Orders.jsx'
+import Menu from './pages/menu/Menu.jsx'
 import Tenants from './pages/Tenants.jsx'
 import TenantForm from './pages/TenantForm.jsx'
 import { api, login as apiLogin, getMe, getToken, clearToken, setUnauthorizedHandler } from './api/client.js'
@@ -14,6 +16,8 @@ const PAGE_TITLES = {
   '/services':             'Services',
   '/agents':               'Agents',
   '/reports':              'Reports',
+  '/orders':               'Orders',
+  '/menu':                 'Menu',
   '/admin/businesses':     'Businesses',
 }
 
@@ -74,6 +78,9 @@ export default function App() {
   const location = useLocation()
 
   const isSuper = !!user?.is_super
+  // Only true once tenants have loaded, so the queue stays the default landing
+  // page for everyone else.
+  const ordersOnly = tenants.length > 0 && tenants.every(t => t.mode === 'orders')
 
   function logout() { clearToken(); setUser(null) }
 
@@ -139,7 +146,7 @@ export default function App() {
       </header>
 
       {/* ── Sidebar (desktop: always visible, mobile: drawer) ──── */}
-      <Sidebar isOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} onLogout={logout} isSuper={isSuper} />
+      <Sidebar isOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} onLogout={logout} isSuper={isSuper} tenants={tenants} />
 
       {/* ── Main content ─────────────────────────────────────────── */}
       <main className="main-content">
@@ -149,10 +156,13 @@ export default function App() {
           </div>
         ) : (
           <Routes>
-            <Route path="/"                    element={<Queue      tenants={tenants} />} />
+            {/* A takeaway-only account has no queue to land on. */}
+            <Route path="/"                    element={ordersOnly ? <Navigate to="/orders" replace /> : <Queue tenants={tenants} />} />
             <Route path="/services"            element={<Services   tenants={tenants} />} />
             <Route path="/agents"              element={<Agents     tenants={tenants} />} />
             <Route path="/reports"             element={<Reports    tenants={tenants} />} />
+            <Route path="/orders"              element={<Orders     tenants={tenants} />} />
+            <Route path="/menu"                element={<Menu       tenants={tenants} />} />
             {/* Business + user management is super-admin only */}
             <Route path="/admin/businesses"          element={isSuper ? <Tenants    tenants={tenants} reload={loadTenants} /> : <Navigate to="/" replace />} />
             <Route path="/admin/businesses/new"      element={isSuper ? <TenantForm tenants={tenants} reload={loadTenants} /> : <Navigate to="/" replace />} />

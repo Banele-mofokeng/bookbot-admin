@@ -20,7 +20,8 @@ from app.jobs import midnight_reset_job, reconcile_notifications
 from app.messaging import outbox_worker
 from app.webhook import router as webhook_router
 from app.api import (agent_routes, analytics_routes, auth_routes, health_routes,
-                     queue_routes, service_routes, tenant_routes)
+                     menu_routes, order_routes, queue_routes, service_routes,
+                     tenant_routes)
 
 app = FastAPI(title="QueueBot — Smart Queue Platform")
 scheduler = AsyncIOScheduler()
@@ -81,6 +82,8 @@ app.include_router(tenant_routes.router)
 app.include_router(service_routes.router)
 app.include_router(agent_routes.router)
 app.include_router(analytics_routes.router)
+app.include_router(menu_routes.router)
+app.include_router(order_routes.router)
 app.include_router(health_routes.router)
 
 

@@ -27,6 +27,18 @@ class Tenant(SQLModel, table=True):
     queue_closes: int          = 17                  # 17 = 17:00
     advance_days: int          = 1                   # how many days ahead allowed (0 = today only)
     is_active: bool            = True
+    # ── Which conversation the bot runs ──
+    # "queue"  — book a slot with an agent (salon, clinic, workshop)
+    # "orders" — order items off a menu (takeaway, kasi fastfood)
+    # One tenant runs one of them. Existing tenants default to queue, so this
+    # column changes nothing for anyone already deployed.
+    mode: str                  = "queue"
+    # ── Ordering config (ignored in queue mode) ──
+    currency_symbol: str       = "R"
+    # How many items the kitchen genuinely works on at once. Prep time for a
+    # backlog is divided by this, so a two-pan kitchen quotes twice the wait of
+    # a four-pan one for the same queue of orders.
+    kitchen_parallel_items: int = 4
 
 
 class User(SQLModel, table=True):
@@ -160,4 +172,76 @@ class OutboxMessage(SQLModel, table=True):
     last_error: str            = ""
     created_at: datetime       = Field(default_factory=now)
     sent_at: Optional[datetime] = None
+
+
+# =============================================================================
+# 2a. ORDERING TABLES
+# =============================================================================
+# Deliberately separate from Service/QueueEntry rather than bent onto them. A
+# queue entry is one service on one agent at one time; an order is several
+# items, in quantities, with money attached and nobody assigned. Sharing the
+# tables would mean every queue query growing an "is this actually an order?"
+# branch.
+
+class MenuItem(SQLModel, table=True):
+    """Something a customer can order e.g. Kota, Chips, 500ml Coke."""
+    __tablename__ = "menu_item"
+    id: Optional[int]          = Field(default=None, primary_key=True)
+    tenant_id: int             = Field(foreign_key="tenant.id")
+    name: str                                        # "Full House Kota"
+    category: str              = ""                  # "Kotas", "Drinks" — blank groups last
+    # Money is in cents, always. Floats lose rands over a day of orders.
+    price_cents: int           = 0
+    prep_minutes: int          = 10                  # how long the kitchen needs
+    is_active: bool            = True                # sold out = deactivate
+    sort_order: int            = 0                   # display order within a category
+
+
+class Order(SQLModel, table=True):
+    """One customer's order, placed over WhatsApp or rung up at the counter."""
+    __tablename__ = "customer_order"  # "order" is a reserved word in SQL
+    id: Optional[int]          = Field(default=None, primary_key=True)
+    tenant_id: int             = Field(foreign_key="tenant.id")
+    customer_number: str       = ""                  # "27764519653@s.whatsapp.net"
+    customer_name: str         = ""
+    customer_phone: str        = ""                  # counter orders: a number to notify
+    status: str                = "Placed"            # Placed|Preparing|Ready|Collected|Cancelled
+    # Written once at placement from the items on the order. Never recomputed
+    # from the menu — a price change tonight must not rewrite this morning's
+    # takings.
+    total_cents: int           = 0
+    order_date: str            = ""                  # "2026-08-02" — ISO date string
+    placed_via: str            = "whatsapp"          # whatsapp | counter
+    ready_at: Optional[datetime] = None              # quoted collection time
+    notified_ready: bool       = False
+    note: str                  = ""                  # "no chilli"
+    created_at: datetime       = Field(default_factory=now)
+    started_at: Optional[datetime]  = None           # first moved to Preparing
+    finished_at: Optional[datetime] = None           # reached a terminal status
+    # Same provenance rule as QueueEntry: "staff", "customer", "system", or ""
+    # on rows written before this existed. Reporting must not merge them — an
+    # order the midnight sweep cancelled means staff never closed it, not that
+    # the customer walked away.
+    closed_by: str             = ""
+
+    @property
+    def code(self) -> str:
+        """Short counter callout code. Unique within a day well past any
+        realistic daily volume; the board is per-day, so wrap-around across
+        days is not a collision anyone sees."""
+        return f"{(self.id or 0) % 1000:03d}"
+
+
+class OrderItem(SQLModel, table=True):
+    """One line on an order. Name and price are snapshots, not lookups."""
+    __tablename__ = "order_item"
+    id: Optional[int]          = Field(default=None, primary_key=True)
+    order_id: int              = Field(foreign_key="customer_order.id")
+    menu_item_id: Optional[int] = Field(default=None, foreign_key="menu_item.id")
+    # Copied at placement so renaming or repricing an item — or deleting it —
+    # leaves historical orders and their totals intact.
+    name: str                  = ""
+    qty: int                   = 1
+    unit_price_cents: int      = 0
+    prep_minutes: int          = 10
 

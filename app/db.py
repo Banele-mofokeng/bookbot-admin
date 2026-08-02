@@ -3,7 +3,8 @@ from sqlmodel import SQLModel, create_engine
 
 from app import config
 from app.models import (Tenant, User, Service, Agent, AgentService,
-                        AgentSchedule, AgentBlock, QueueEntry, OutboxMessage)
+                        AgentSchedule, AgentBlock, QueueEntry, OutboxMessage,
+                        MenuItem, Order, OrderItem)
 
 engine = create_engine(config.DATABASE_URL)
 
@@ -38,6 +39,16 @@ INDEXES = [
      "agent_id, starts_at"),
     # Every inbound webhook resolves the tenant by its WhatsApp number.
     ("ix_tenant_whatsapp", Tenant.__tablename__, "whatsapp_number"),
+    # ── Ordering ──
+    # The kitchen board, and the backlog read behind every quoted ready time.
+    ("ix_order_tenant_date_status", Order.__tablename__,
+     "tenant_id, order_date, status"),
+    # "What did I order?" — runs on every customer status or cancel request.
+    ("ix_order_tenant_customer_date", Order.__tablename__,
+     "tenant_id, customer_number, order_date"),
+    # Lines are always fetched by their order, never on their own.
+    ("ix_orderitem_order", OrderItem.__tablename__, "order_id"),
+    ("ix_menuitem_tenant", MenuItem.__tablename__, "tenant_id"),
 ]
 
 
@@ -63,9 +74,9 @@ def ensure_indexes():
         conn.commit()
 
 
-# Columns added to queueentry after the table first shipped. create_all() never
-# alters an existing table, so an already-deployed database only gets these from
-# here. Order is irrelevant — each is added only if absent.
+# Columns added to a table after it first shipped. create_all() never alters an
+# existing table, so an already-deployed database only gets these from here.
+# Order is irrelevant — each is added only if absent.
 QUEUEENTRY_COLUMNS = [
     ("parent_entry_id",  "INTEGER"),
     ("earliest_arrival", "TIMESTAMP"),
@@ -76,6 +87,20 @@ QUEUEENTRY_COLUMNS = [
     ("finished_at",      "TIMESTAMP"),
 ]
 
+# Ordering config on an existing tenant row. The defaults matter: every tenant
+# already deployed is a queue tenant, and must stay one until someone says
+# otherwise on the dashboard.
+TENANT_COLUMNS = [
+    ("mode",                   "VARCHAR DEFAULT 'queue'"),
+    ("currency_symbol",        "VARCHAR DEFAULT 'R'"),
+    ("kitchen_parallel_items", "INTEGER DEFAULT 4"),
+]
+
+ADDED_COLUMNS = {
+    "queueentry": QUEUEENTRY_COLUMNS,
+    "tenant":     TENANT_COLUMNS,
+}
+
 
 def create_db_and_tables():
     from sqlalchemy import text as sql_text
@@ -83,14 +108,15 @@ def create_db_and_tables():
     ensure_indexes()
     # Add new columns to existing tables if they don't exist yet (PostgreSQL migration)
     with engine.connect() as conn:
-        existing = {row[0] for row in conn.execute(sql_text(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_name = 'queueentry'"
-        )).fetchall()}
-        for column, coltype in QUEUEENTRY_COLUMNS:
-            if column not in existing:
-                conn.execute(sql_text(
-                    f"ALTER TABLE queueentry ADD COLUMN {column} {coltype}"
-                ))
-                conn.commit()
+        for table, columns in ADDED_COLUMNS.items():
+            existing = {row[0] for row in conn.execute(sql_text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = :table"
+            ), {"table": table}).fetchall()}
+            for column, coltype in columns:
+                if column not in existing:
+                    conn.execute(sql_text(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"
+                    ))
+                    conn.commit()
 

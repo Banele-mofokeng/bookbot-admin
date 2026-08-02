@@ -49,6 +49,15 @@ def format_eta(dt: Optional[datetime]) -> str:
     return dt.strftime("%H:%M")
 
 
+def format_money(cents: int, symbol: str = "R") -> str:
+    """Money for humans. Whole amounts lose the ".00" — a menu reads R45, not
+    R45.00, and a till slip still needs the cents when there are any."""
+    cents = int(cents or 0)
+    if cents % 100 == 0:
+        return f"{symbol}{cents // 100}"
+    return f"{symbol}{cents / 100:.2f}"
+
+
 # Indexed by datetime.weekday() — Monday is 0, matching AgentSchedule.weekday.
 WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday",
                  "Friday", "Saturday", "Sunday"]

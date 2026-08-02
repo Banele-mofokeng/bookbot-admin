@@ -12,7 +12,8 @@ from sqlalchemy import text
 from sqlmodel import Session, select
 
 from app import db
-from app.models import QueueEntry, OutboxMessage, Tenant, Service, Agent, AgentService, AgentSchedule, AgentBlock
+from app.models import (QueueEntry, OutboxMessage, Tenant, Service, Agent, AgentService,
+                        AgentSchedule, AgentBlock, MenuItem, Order, OrderItem)
 
 
 def _index_names():
@@ -54,6 +55,7 @@ def test_index_tables_match_the_models():
         Service.__tablename__, Agent.__tablename__,
         AgentService.__tablename__, Tenant.__tablename__,
         AgentSchedule.__tablename__, AgentBlock.__tablename__,
+        MenuItem.__tablename__, Order.__tablename__, OrderItem.__tablename__,
     }
 
 
