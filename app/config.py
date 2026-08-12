@@ -28,6 +28,19 @@ OUTBOX_MAX_ATTEMPTS  = 5     # then give up and mark Failed
 OUTBOX_SEND_TIMEOUT  = 10.0  # seconds per Evolution call
 # How often to re-derive notifications that should have fired from queue state.
 RECONCILE_SECONDS    = 60
+# How often to look for appointment reminders that have come due. Coarser than
+# the queue reconciler on purpose: a reminder a few minutes either side of the
+# hour is indistinguishable to the customer, and this sweep reads every live
+# appointment across every tenant.
+REMINDER_SWEEP_SECONDS = 300
+# How late a reminder may still go out, as a fraction of its own lead time. A
+# day-ahead rung tolerates hours; a half-hour rung tolerates minutes. Expressed
+# this way because lateness is only ever a lie relative to what the message
+# claims — "your appointment is tomorrow" is fine eleven hours late and absurd
+# twenty-three hours late, by which point the appointment is today.
+REMINDER_GRACE_FRACTION    = 0.5
+# ...but never less than this, or a short rung could expire between two ticks.
+REMINDER_MIN_GRACE_MINUTES = 15
 
 # ── Midnight sweep ───────────────────────────────────────────────────────────
 # How many rows the sweep closes per transaction. It runs over every date

@@ -494,14 +494,62 @@ menu → 1 book → day → service → person → time → confirm
   confirms the same slot first, the second customer is told plainly and shown
   what is left. They are never quietly given a different time.
 
+### Reminders
+
+`reminder_offsets_minutes` is a list of minutes before the appointment, largest
+first. `"1440,120"` — the default — is a day ahead so the customer can move it,
+and two hours ahead so they actually leave. Blank switches reminders off.
+
+`reminder_sweep` runs every `REMINDER_SWEEP_SECONDS` (300) and derives what is
+due from live state, exactly like the queue's 15-minute warning. **No timer is
+persisted**, so a restart or a crash cannot lose a reminder.
+
+Each offset is a *rung*, and a rung is sendable across a window rather than at
+an instant. Two things close that window, earlier wins:
+
+- **The next rung takes over.** Once "in about two hours" is due, "tomorrow" has
+  nothing left to say.
+- **Its own lateness budget — half its lead time**, floored at 15 minutes. The
+  message is worded from the nominal offset, so lateness is bounded by when that
+  wording stops being true. "Your appointment is tomorrow" survives eleven hours
+  of outage and is absurd twenty-three hours late, by which point the
+  appointment is today.
+
+A rung whose whole window is missed is **skipped, not sent late**. That is what
+stops a business switching reminders on at lunchtime from sending every customer
+a day-ahead notice for appointments starting within the hour.
+
+Reminders only ever go to fixed entries. A queue entry has no promised time to
+remind anyone about and keeps the 15-minute warning it already had — nothing
+changes for a queue or ordering tenant.
+
+**Never at 03:00.** A rung that comes due outside `queue_opens`–`queue_closes`
+waits for opening, which it can do because the rung stays open. Only a rung
+whose entire window sits outside business hours is lost, which takes a
+deliberately odd configuration.
+
+> **Before moving off Evolution:** these are business-initiated messages, often
+> sent more than 24 hours after the customer last wrote. Evolution rides the
+> WhatsApp Web protocol and does not care. The official Cloud API does — outside
+> the 24-hour customer service window it accepts only approved template
+> messages. Reminders are the part of this product that would need reworking
+> first on a migration, not the booking flow.
+
 ### Config
 
 | Field | Meaning |
 |---|---|
 | `mode` | `"appointments"` |
 | `slot_granularity_minutes` | the grid, default 30. Rejected outside 5–240 — a zero makes the engine offer nothing at all, silently |
+| `reminder_offsets_minutes` | `"1440,120"`. Up to 4 rungs, each at most a fortnight. Blank = off |
 | `advance_days` | how far ahead customers may book |
-| `queue_opens` / `queue_closes` | the day's bounds; per-agent schedules narrow it from there |
+| `queue_opens` / `queue_closes` | the day's bounds; per-agent schedules narrow it from there, and reminders are held inside them |
+
+The sweep tolerates a malformed `reminder_offsets_minutes` — it drops what it
+cannot parse rather than raising, so one tenant's typo cannot stop everybody
+else's reminders. The dashboard rejects it at the point somebody types it,
+because a silent switch-off would not be noticed until a customer failed to
+arrive.
 
 Services, agents, agent schedules and blocks all work exactly as they do for a
 queue tenant — an appointment tenant uses the same **Services**, **Agents** and
@@ -510,8 +558,10 @@ queue tenant — an appointment tenant uses the same **Services**, **Agents** an
 ### Migration
 
 `mode` defaults to `"queue"`, so nothing changes for a deployed tenant until
-someone picks the new mode on the dashboard. `slot_granularity_minutes` is added
-by `ADDED_COLUMNS` with a default of 30 and is ignored in every other mode.
+someone picks the new mode on the dashboard. `slot_granularity_minutes` (30) and
+`reminder_offsets_minutes` (`"1440,120"`) are added by `ADDED_COLUMNS` and are
+ignored in every other mode — a queue tenant inherits a reminder ladder that
+nothing will ever read, because the sweep only looks at fixed entries.
 
 ---
 

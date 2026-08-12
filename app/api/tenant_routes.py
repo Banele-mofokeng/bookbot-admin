@@ -35,6 +35,7 @@ class TenantCreate(SQLModel):
     currency_symbol:        str = "R"
     kitchen_parallel_items: int = 4
     slot_granularity_minutes: int = 30
+    reminder_offsets_minutes: str = "1440,120"
 
 
 @router.get("/admin/tenants")
@@ -54,6 +55,13 @@ MODES = ["queue", "orders", "appointments"]
 MIN_GRANULARITY, MAX_GRANULARITY = 5, 240
 
 
+# Five reminders about one haircut is not a service, it is a nuisance. The
+# ceiling is a fortnight because a rung further out than the booking window can
+# never come due.
+MAX_REMINDERS       = 4
+MAX_REMINDER_OFFSET = 14 * 24 * 60
+
+
 def _validate_granularity(value):
     if not isinstance(value, int) or not (MIN_GRANULARITY <= value <= MAX_GRANULARITY):
         raise HTTPException(
@@ -62,12 +70,40 @@ def _validate_granularity(value):
                    f"{MIN_GRANULARITY} and {MAX_GRANULARITY}")
 
 
+def _validate_reminders(value):
+    """
+    Rejected here rather than tolerated, even though the sweep itself drops
+    nonsense rather than raising. A typo that silently switched a clinic's
+    reminders off would not be noticed until somebody failed to arrive.
+    """
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400,
+                            detail="reminder_offsets_minutes must be a string")
+    raw = [p.strip() for p in value.split(",") if p.strip()]
+    for part in raw:
+        if not part.lstrip("-").isdigit() or int(part) <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"reminder_offsets_minutes: {part!r} is not a "
+                       f"positive number of minutes")
+        if int(part) > MAX_REMINDER_OFFSET:
+            raise HTTPException(
+                status_code=400,
+                detail=f"reminder_offsets_minutes: {part} is more than "
+                       f"{MAX_REMINDER_OFFSET} minutes ahead")
+    if len(core.parse_reminder_offsets(value)) > MAX_REMINDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"at most {MAX_REMINDERS} reminders per appointment")
+
+
 @router.post("/admin/tenants")
 def create_tenant(data: TenantCreate, _: User = Depends(require_super)):
     if data.mode not in MODES:
         raise HTTPException(status_code=400,
                             detail=f"mode must be one of {', '.join(MODES)}")
     _validate_granularity(data.slot_granularity_minutes)
+    _validate_reminders(data.reminder_offsets_minutes)
     tenant = Tenant(**data.dict())
     with Session(engine) as s:
         s.add(tenant)
@@ -89,6 +125,8 @@ def update_tenant(tenant_id: int, updates: Dict[str, Any],
                                 detail=f"mode must be one of {', '.join(MODES)}")
         if "slot_granularity_minutes" in updates:
             _validate_granularity(updates["slot_granularity_minutes"])
+        if "reminder_offsets_minutes" in updates:
+            _validate_reminders(updates["reminder_offsets_minutes"])
         for k, v in updates.items():
             if hasattr(tenant, k):
                 setattr(tenant, k, v)

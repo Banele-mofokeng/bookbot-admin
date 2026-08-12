@@ -16,7 +16,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app import config
 from app.auth import seed_superadmin
 from app.db import create_db_and_tables
-from app.jobs import midnight_reset_job, reconcile_notifications
+from app.jobs import midnight_reset_job, reconcile_notifications, reminder_sweep
 from app.messaging import outbox_worker
 from app.webhook import router as webhook_router
 from app.api import (agent_routes, analytics_routes, auth_routes, health_routes,
@@ -47,6 +47,8 @@ async def on_startup():
     scheduler.add_job(midnight_reset_job, "cron", hour=0, minute=1, id="midnight_reset")
     scheduler.add_job(reconcile_notifications, "interval",
                       seconds=config.RECONCILE_SECONDS, id="reconcile_notifications")
+    scheduler.add_job(reminder_sweep, "interval",
+                      seconds=config.REMINDER_SWEEP_SECONDS, id="reminder_sweep")
     scheduler.start()
     # Catch up on anything missed while the process was down: the 00:01 cron
     # doesn't fire retroactively, so a restart spanning midnight would otherwise
