@@ -52,6 +52,29 @@ INDEXES = [
 ]
 
 
+# Constraint-bearing indexes, kept apart from INDEXES because these are UNIQUE
+# and partial rather than plain.
+#
+# The one below is not a performance index at all. It is the last line of
+# defence against booking one agent twice for one moment: booking_lock degrades
+# open when Redis is unreachable (see app/sessions.py), which for a queue costs
+# a mis-assignment staff can fix, and for an appointment costs two customers
+# sent to the same chair at the same time. Scoped to fixed, still-active rows,
+# so cancelled and finished appointments never block rebooking the slot.
+#
+# It catches identical starts, which is the collision the grid actually
+# produces. Partial overlap — 10:00 for 45 minutes against 10:30 — is caught by
+# the explicit check in reserve_appointment instead; expressing that as a
+# constraint needs PostgreSQL range exclusions, which SQLite cannot run and the
+# test suite therefore could not exercise.
+UNIQUE_INDEXES = [
+    # name, table, columns, predicate
+    ("uq_queueentry_agent_slot", QueueEntry.__tablename__,
+     "agent_id, estimated_start",
+     "is_fixed AND status IN ('Waiting', 'InService')"),
+]
+
+
 def ensure_indexes():
     """
     Create the hot-path indexes if they're missing.
@@ -71,6 +94,11 @@ def ensure_indexes():
             conn.execute(sql_text(
                 f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})"
             ))
+        for name, table, columns, predicate in UNIQUE_INDEXES:
+            conn.execute(sql_text(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {name} "
+                f"ON {table} ({columns}) WHERE {predicate}"
+            ))
         conn.commit()
 
 
@@ -85,6 +113,11 @@ QUEUEENTRY_COLUMNS = [
     ("closed_by",        "VARCHAR DEFAULT ''"),
     ("started_at",       "TIMESTAMP"),
     ("finished_at",      "TIMESTAMP"),
+    # Appointments. Every row already deployed is a queue entry whose start is
+    # derived, so the default has to be false — flipping it would freeze every
+    # live queue's ETAs where they stand.
+    ("is_fixed",         "BOOLEAN DEFAULT false"),
+    ("slot_end",         "TIMESTAMP"),
 ]
 
 # Ordering config on an existing tenant row. The defaults matter: every tenant
@@ -94,6 +127,7 @@ TENANT_COLUMNS = [
     ("mode",                   "VARCHAR DEFAULT 'queue'"),
     ("currency_symbol",        "VARCHAR DEFAULT 'R'"),
     ("kitchen_parallel_items", "INTEGER DEFAULT 4"),
+    ("slot_granularity_minutes", "INTEGER DEFAULT 30"),
 ]
 
 ADDED_COLUMNS = {
@@ -148,8 +182,12 @@ def backfill_notification_log():
 def create_db_and_tables():
     from sqlalchemy import text as sql_text
     SQLModel.metadata.create_all(engine)
-    ensure_indexes()
-    # Add new columns to existing tables if they don't exist yet (PostgreSQL migration)
+    # Add new columns to existing tables if they don't exist yet (PostgreSQL
+    # migration). This has to happen before ensure_indexes, not after: an index
+    # over a column that only arrives here cannot be built until it exists.
+    # uq_queueentry_agent_slot is the first index to depend on a column from
+    # this list, so the old order would simply have failed on any existing
+    # database.
     with engine.connect() as conn:
         for table, columns in ADDED_COLUMNS.items():
             existing = {row[0] for row in conn.execute(sql_text(
@@ -162,6 +200,7 @@ def create_db_and_tables():
                         f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"
                     ))
                     conn.commit()
-    # Last, so it runs against a schema that is already up to date.
+    # Both of these run against a schema that is now up to date.
+    ensure_indexes()
     backfill_notification_log()
 

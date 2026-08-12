@@ -40,6 +40,11 @@ class Tenant(SQLModel, table=True):
     # backlog is divided by this, so a two-pan kitchen quotes twice the wait of
     # a four-pan one for the same queue of orders.
     kitchen_parallel_items: int = 4
+    # ── Appointment config (ignored outside appointment booking) ──
+    # The grid offered times land on. 30 means 09:00, 09:30, 10:00 — predictable
+    # for a customer to read and for a calendar to draw. A service longer than
+    # one step simply consumes several.
+    slot_granularity_minutes: int = 30
 
 
 class User(SQLModel, table=True):
@@ -134,6 +139,18 @@ class QueueEntry(SQLModel, table=True):
     queue_date: str                                  # "2026-03-18" — ISO date string
     estimated_start: Optional[datetime] = None       # calculated ETA
     earliest_arrival: Optional[datetime] = None      # customer's declared arrival time
+    # ── Appointments ──
+    # A queue entry's estimated_start is *derived*: recalculate_queue rewrites
+    # it whenever anything ahead of it changes, which is right for a queue and
+    # wrong for a booked time. is_fixed says this start is a promise. Fixed
+    # entries are never rewritten; they become obstacles the flexible queue is
+    # scheduled around, which is also what lets walk-ins fill the gaps between
+    # them.
+    is_fixed: bool             = False
+    # When the promise ends. Written once at booking rather than derived from
+    # Service.duration_minutes, so retiming a service tomorrow cannot silently
+    # move the end of an appointment booked today.
+    slot_end: Optional[datetime] = None
     position: int              = 0                   # display position in full queue
     # Superseded by NotificationLog, which is now what decides whether a
     # notification has been claimed. Still written, so a rollout where old and

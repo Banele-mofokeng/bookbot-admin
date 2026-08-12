@@ -14,10 +14,12 @@ os.environ["JWT_SECRET"] = "test-secret"
 os.environ["SUPERADMIN_EMAIL"] = "super@test.com"
 os.environ["SUPERADMIN_PASSWORD"] = "superpass123"
 
+import threading
+
 import pytest
 from sqlmodel import SQLModel
 import main
-from app import auth, db
+from app import auth, config, db
 
 
 @pytest.fixture(autouse=True)
@@ -34,6 +36,52 @@ def fresh_db():
     db.engine.dispose()
     auth.seed_superadmin()
     yield
+
+
+class FakeRedis:
+    """SET NX EX + the compare-and-delete EVAL, enough for booking_lock."""
+
+    def __init__(self):
+        self.store = {}
+        self._lock = threading.Lock()
+        self.set_calls = 0
+
+    def set(self, key, value, nx=False, ex=None):
+        with self._lock:
+            self.set_calls += 1
+            if nx and key in self.store:
+                return None
+            self.store[key] = value
+            return True
+
+    def eval(self, script, numkeys, key, arg):
+        with self._lock:
+            if self.store.get(key) == arg:
+                del self.store[key]
+                return 1
+            return 0
+
+
+class BrokenRedis:
+    def set(self, *a, **k):
+        raise ConnectionError("redis down")
+
+    def eval(self, *a, **k):
+        raise ConnectionError("redis down")
+
+
+@pytest.fixture
+def fake_redis(monkeypatch):
+    """A working lock. Anything that books goes through booking_lock."""
+    fake = FakeRedis()
+    monkeypatch.setattr(config, "redis_client", fake)
+    return fake
+
+
+@pytest.fixture
+def broken_redis(monkeypatch):
+    """An unreachable lock — booking_lock is documented to degrade open."""
+    monkeypatch.setattr(config, "redis_client", BrokenRedis())
 
 
 @pytest.fixture

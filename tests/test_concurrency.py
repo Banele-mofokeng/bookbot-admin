@@ -285,44 +285,8 @@ def test_get_queue_tolerates_a_deleted_service(super_token):
 # =============================================================================
 # Booking lock
 # =============================================================================
-class FakeRedis:
-    """SET NX EX + the compare-and-delete EVAL, enough for booking_lock."""
-
-    def __init__(self):
-        self.store = {}
-        self._lock = threading.Lock()
-        self.set_calls = 0
-
-    def set(self, key, value, nx=False, ex=None):
-        with self._lock:
-            self.set_calls += 1
-            if nx and key in self.store:
-                return None
-            self.store[key] = value
-            return True
-
-    def eval(self, script, numkeys, key, arg):
-        with self._lock:
-            if self.store.get(key) == arg:
-                del self.store[key]
-                return 1
-            return 0
-
-
-class BrokenRedis:
-    def set(self, *a, **k):
-        raise ConnectionError("redis down")
-
-    def eval(self, *a, **k):
-        raise ConnectionError("redis down")
-
-
-@pytest.fixture
-def fake_redis(monkeypatch):
-    fake = FakeRedis()
-    monkeypatch.setattr(config, "redis_client", fake)
-    return fake
-
+# FakeRedis, BrokenRedis and their fixtures now live in conftest — the slot
+# engine books through the same lock and needs them too.
 
 def test_lock_is_acquired_and_released(fake_redis):
     key = f"lock:booking:1:{DATE}"
@@ -376,8 +340,7 @@ def test_release_is_compare_and_delete(fake_redis, monkeypatch):
     assert fake_redis.store[key] == "somebody-elses-token"
 
 
-def test_lock_degrades_open_when_redis_is_down(monkeypatch):
-    monkeypatch.setattr(config, "redis_client", BrokenRedis())
+def test_lock_degrades_open_when_redis_is_down(broken_redis):
     ran = False
     with sessions.booking_lock(1, DATE) as held:
         assert held is False
