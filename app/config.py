@@ -29,6 +29,14 @@ OUTBOX_SEND_TIMEOUT  = 10.0  # seconds per Evolution call
 # How often to re-derive notifications that should have fired from queue state.
 RECONCILE_SECONDS    = 60
 
+# ── Midnight sweep ───────────────────────────────────────────────────────────
+# How many rows the sweep closes per transaction. It runs over every date
+# before today rather than yesterday alone, so the first pass after a long
+# outage — or after this range sweep first ships onto a database that has been
+# accumulating stragglers — can face far more than one night's worth. Batching
+# keeps that off a single long-held write lock.
+SWEEP_BATCH          = 500
+
 # ── Booking lock ─────────────────────────────────────────────────────────────
 # Agent assignment reads the queue, then writes to it. Two bookings landing
 # between the read and the write both pick the same "shortest backlog" agent.

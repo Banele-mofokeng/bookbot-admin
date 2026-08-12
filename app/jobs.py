@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 from sqlmodel import Session, select
 
-from app import core
+from app import config, core
 from app.core import format_eta, normalize_number
 from app.db import engine
 from app.models import Tenant, Service, Agent, Order, QueueEntry
@@ -150,49 +150,92 @@ def _fire_youre_next(tenant_id: int, agent_id: int, queue_date: str):
     _claim_notification(entry_id, "notified_two_away")
     send_text(tenant, notify_to, body, dedupe_key=f"youre_next:{entry_id}")
 
+def _sweep_stale_orders(today: str) -> int:
+    """
+    Cancel every unclosed order from a day before today. Returns how many.
+
+    Never auto-Collected: that would book money as taken for food that may
+    still be sitting on the pass. Cancelled and tagged as ours, so takings and
+    reporting stay honest about what actually got sold.
+
+    A blank order_date is skipped rather than swept. It sorts before every real
+    date, so a range sweep would close rows whose day is simply unknown — and
+    the old equality sweep never touched them.
+    """
+    total = 0
+    while True:
+        with Session(engine) as s:
+            batch = s.exec(
+                select(Order).where(
+                    Order.order_date < today,
+                    Order.order_date != "",
+                    Order.status.in_(["Placed", "Preparing", "Ready"]),
+                ).limit(config.SWEEP_BATCH)
+            ).all()
+            for order in batch:
+                order.status      = "Cancelled"
+                order.closed_by   = "system"
+                order.finished_at = core.now()
+                s.add(order)
+            s.commit()
+        total += len(batch)
+        # Each pass moves its rows out of the filtered statuses, so the loop
+        # always makes progress and a short batch means the table is drained.
+        if len(batch) < config.SWEEP_BATCH:
+            return total
+
+
+def _sweep_stale_entries(today: str) -> int:
+    """
+    Close every queue entry left open on a day before today. Returns how many.
+
+    Never auto-marked Done — staff never closed it, so it does not count as
+    completed work. Abandoned entries close as NoShow, tagged as ours rather
+    than the customer's: reporting keeps these out of the no-show rate, because
+    nobody knows whether this customer turned up, only that the shop never
+    closed the entry.
+    """
+    total = 0
+    while True:
+        with Session(engine) as s:
+            batch = s.exec(
+                select(QueueEntry).where(
+                    QueueEntry.queue_date < today,
+                    QueueEntry.queue_date != "",
+                    QueueEntry.status.in_(["Waiting", "InService"]),
+                ).limit(config.SWEEP_BATCH)
+            ).all()
+            for entry in batch:
+                entry.status      = "NoShow"
+                entry.closed_by   = "system"
+                entry.finished_at = core.now()
+                s.add(entry)
+            s.commit()
+        total += len(batch)
+        if len(batch) < config.SWEEP_BATCH:
+            return total
+
+
 async def midnight_reset_job():
-    """Runs at 00:01 every night. Closes out yesterday's queue and orders."""
+    """
+    Runs at 00:01 every night, and once more on startup. Closes out every day
+    before today that nobody closed — not yesterday alone.
+
+    Sweeping a range rather than a single date is what makes the job durable.
+    The 00:01 cron does not fire retroactively, so a process down across two
+    midnights used to leave the older day open forever: its entries stay
+    Waiting, keep occupying their agent in every backlog and ETA calculation,
+    and never reach reporting as closed. One day's outage was untidy; anything
+    booked further ahead than today makes it permanent.
+
+    Today itself is never touched — the shop is still working it.
+    """
     print("🌙 Running midnight reset...")
-    yesterday = core.yesterday_str()
+    today = core.today_str()
 
-    with Session(engine) as s:
-        # Orders nobody closed. Never auto-Collected: that would book money as
-        # taken for food that may still be sitting on the pass. Cancelled and
-        # tagged as ours, so takings and reporting stay honest about what
-        # actually got sold.
-        stale_orders = s.exec(
-            select(Order).where(
-                Order.order_date == yesterday,
-                Order.status.in_(["Placed", "Preparing", "Ready"]),
-            )
-        ).all()
-        for order in stale_orders:
-            order.status      = "Cancelled"
-            order.closed_by   = "system"
-            order.finished_at = core.now()
-            s.add(order)
-        s.commit()
+    stale_orders = _sweep_stale_orders(today)
+    leftover     = _sweep_stale_entries(today)
 
-    with Session(engine) as s:
-        leftover = s.exec(
-            select(QueueEntry).where(
-                QueueEntry.queue_date == yesterday,
-                QueueEntry.status.in_(["Waiting", "InService"])
-            )
-        ).all()
-
-        for entry in leftover:
-            # Never auto-mark as Done — staff never closed it, so it doesn't
-            # count as completed work. Abandoned entries close as NoShow.
-            entry.status      = "NoShow"
-            # Tagged as ours, not the customer's. Reporting keeps these out of
-            # the no-show rate: nobody knows whether this customer turned up,
-            # only that the shop never closed the entry.
-            entry.closed_by   = "system"
-            entry.finished_at = core.now()
-            s.add(entry)
-
-        s.commit()
-    print(f"🌙 Reset complete. {len(leftover)} entries and "
-          f"{len(stale_orders)} orders closed.")
+    print(f"🌙 Reset complete. {leftover} entries and "
+          f"{stale_orders} orders closed.")
 
