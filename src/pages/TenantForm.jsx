@@ -17,9 +17,10 @@ const EMPTY = {
   evolution_api_url:  '',
   evolution_api_key:  '',
   is_active:          true,
-  mode:                   'queue',
-  currency_symbol:        'R',
-  kitchen_parallel_items: 4,
+  mode:                     'queue',
+  currency_symbol:          'R',
+  kitchen_parallel_items:   4,
+  slot_granularity_minutes: 30,
 }
 
 function Field({ label, hint, error, children }) {
@@ -115,7 +116,8 @@ export default function TenantForm({ tenants, reload }) {
   const [errors, setErrors] = useState({})
   const [saving, setSaving] = useState(false)
 
-  const isOrders = form.mode === 'orders'
+  const isOrders       = form.mode === 'orders'
+  const isAppointments = form.mode === 'appointments'
 
   useEffect(() => {
     if (isEdit) {
@@ -212,7 +214,8 @@ export default function TenantForm({ tenants, reload }) {
         <div className="form-page-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
           <Field label="Mode">
             <SelectInput value={form.mode} onChange={setText('mode')}>
-              <option value="queue">Queue bookings — salon, clinic, workshop</option>
+              <option value="queue">Queue bookings — join a line, get an ETA</option>
+              <option value="appointments">Appointments — pick a fixed time</option>
               <option value="orders">Takeaway orders — kitchen, kota shop</option>
             </SelectInput>
           </Field>
@@ -262,8 +265,10 @@ export default function TenantForm({ tenants, reload }) {
 
             <Divider />
 
-            {/* ── Queue Config ── */}
-            <SectionHeader label="Queue Config" />
+            {/* ── Hours. Shared by both booking modes: an appointment day is
+                 still bounded by opening hours, and per-agent schedules narrow
+                 it from there. ── */}
+            <SectionHeader label={isAppointments ? 'Appointment Config' : 'Queue Config'} />
             <div className="form-page-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16 }}>
               <Field label="Opens (24h)" hint="e.g. 8 = 08:00">
                 <NumberInput value={form.queue_opens} onChange={setNum('queue_opens')} min={0} max={23} />
@@ -271,10 +276,24 @@ export default function TenantForm({ tenants, reload }) {
               <Field label="Closes (24h)" hint="e.g. 17 = 17:00" error={errors.queue_closes}>
                 <NumberInput value={form.queue_closes} onChange={setNum('queue_closes')} min={1} max={24} />
               </Field>
-              <Field label="Advance Days" hint="0 = today only, 1 = today + tomorrow">
-                <NumberInput value={form.advance_days} onChange={setNum('advance_days')} min={0} max={14} />
+              <Field label="Advance Days"
+                hint={isAppointments
+                  ? 'How far ahead customers may book. 14 = two weeks.'
+                  : '0 = today only, 1 = today + tomorrow'}>
+                <NumberInput value={form.advance_days} onChange={setNum('advance_days')}
+                  min={0} max={isAppointments ? 60 : 14} />
               </Field>
             </div>
+
+            {isAppointments && (
+              <div style={{ marginTop: 16, maxWidth: 260 }}>
+                <Field label="Slot Every (min)"
+                  hint="The grid times land on. 30 offers 09:00, 09:30, 10:00. A longer service simply uses several.">
+                  <NumberInput value={form.slot_granularity_minutes}
+                    onChange={setNum('slot_granularity_minutes')} min={5} max={240} />
+                </Field>
+              </div>
+            )}
           </>
         )}
 

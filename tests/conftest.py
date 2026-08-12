@@ -39,7 +39,16 @@ def fresh_db():
 
 
 class FakeRedis:
-    """SET NX EX + the compare-and-delete EVAL, enough for booking_lock."""
+    """
+    Enough Redis for the two things the app uses it for: booking_lock
+    (SET NX EX plus the compare-and-delete EVAL) and the conversation session
+    store (GET / SETEX / DEL).
+
+    Expiry is not modelled. Nothing under test depends on a key ageing out —
+    the session TTL exists to tidy up abandoned conversations, not to drive
+    behaviour — and a fake clock here would only be a second thing to keep
+    honest.
+    """
 
     def __init__(self):
         self.store = {}
@@ -53,6 +62,19 @@ class FakeRedis:
                 return None
             self.store[key] = value
             return True
+
+    def get(self, key):
+        with self._lock:
+            return self.store.get(key)
+
+    def setex(self, key, ttl, value):
+        with self._lock:
+            self.store[key] = value
+            return True
+
+    def delete(self, key):
+        with self._lock:
+            return 1 if self.store.pop(key, None) is not None else 0
 
     def eval(self, script, numkeys, key, arg):
         with self._lock:

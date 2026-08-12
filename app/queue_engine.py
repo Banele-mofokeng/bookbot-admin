@@ -615,6 +615,64 @@ def recalculate_queue(tenant_id: int, agent_id: int, queue_date: str):
         s.commit()
 
 
+def free_slots_by_agent(tenant: Tenant, service_id: int, queue_date: str,
+                        duration_minutes: int,
+                        floor: Optional[datetime] = None,
+                        limit_per_agent: Optional[int] = None) -> Dict[int, List]:
+    """
+    Bookable start times per agent, for everyone who can do this service and is
+    working that date. An agent who is off, or blocked out for the whole day,
+    simply isn't in the result.
+    """
+    with Session(engine) as s:
+        tenant_agent_ids = [
+            a.id for a in s.exec(
+                select(Agent).where(Agent.tenant_id == tenant.id,
+                                    Agent.is_active == True)
+            ).all()
+        ]
+        if not tenant_agent_ids:
+            return {}
+        capable = [
+            row.agent_id for row in s.exec(
+                select(AgentService).where(
+                    AgentService.service_id == service_id,
+                    AgentService.agent_id.in_(tenant_agent_ids),
+                )
+            ).all()
+        ]
+    if not capable:
+        return {}
+
+    windows = get_working_windows_for(capable, tenant, queue_date)
+    out: Dict[int, List] = {}
+    for aid in capable:
+        if not windows.get(aid):
+            continue
+        slots = get_free_slots(tenant, aid, queue_date, duration_minutes,
+                               floor=floor, limit=limit_per_agent)
+        if slots:
+            out[aid] = slots
+    return out
+
+
+def pick_agent_for_slot(tenant: Tenant, service_id: int, queue_date: str,
+                        start: datetime, duration_minutes: int) -> Optional[int]:
+    """
+    Which agent should take this time when the customer had no preference.
+
+    Least-loaded of whoever actually has that start free — the same
+    shortest-backlog rule assign_agent uses for the queue, narrowed to agents
+    who can genuinely honour the slot.
+    """
+    by_agent = free_slots_by_agent(tenant, service_id, queue_date, duration_minutes)
+    candidates = [aid for aid, slots in by_agent.items() if start in slots]
+    if not candidates:
+        return None
+    backlogs = get_agent_backlogs_minutes(candidates, tenant.id, queue_date)
+    return min(candidates, key=lambda aid: backlogs.get(aid, 0))
+
+
 def slot_is_taken(s: Session, agent_id: int, tenant_id: int, queue_date: str,
                   start: datetime, end: datetime,
                   exclude_entry_id: Optional[int] = None) -> bool:

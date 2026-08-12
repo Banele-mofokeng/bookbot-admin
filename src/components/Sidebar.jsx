@@ -42,13 +42,19 @@ const SUPER_NAV = [
 
 export default function Sidebar({ isOpen, onClose, onLogout, isSuper, tenants = [] }) {
   // A super-admin sees whatever their portfolio needs; a client sees only what
-  // their own business runs. Before any tenant loads, fall back to the queue
+  // their own business runs. Before any tenant loads, fall back to the booking
   // nav — that is what every existing deployment is.
-  const hasOrders = tenants.some(t => t.mode === 'orders')
-  const hasQueue  = tenants.some(t => t.mode !== 'orders') || tenants.length === 0
+  //
+  // Named modes rather than "anything that isn't orders". There are three now,
+  // and a fourth would silently inherit the booking nav under the old test —
+  // which happens to be right for appointments and would not be for whatever
+  // comes next.
+  const hasOrders   = tenants.some(t => t.mode === 'orders')
+  const hasBookings = tenants.some(t => t.mode === 'queue' || t.mode === 'appointments')
+                      || tenants.length === 0
 
   const navItems = [
-    ...(hasQueue ? NAV : []),
+    ...(hasBookings ? NAV : []),
     ...(hasOrders ? ORDERS_NAV : []),
     ...(isSuper ? SUPER_NAV : []),
   ]
