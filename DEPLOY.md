@@ -10,6 +10,7 @@
 | `app/webhook.py` | The queue-booking WhatsApp conversation |
 | `app/orders.py` | Ordering: pricing, kitchen backlog, ready-time quotes |
 | `app/orders_flow.py` | The takeaway WhatsApp conversation |
+| `app/appointments_flow.py` | The appointment-booking WhatsApp conversation |
 | `app/messaging.py` | Outbox table, delivery worker, menu builders |
 | `app/jobs.py` | Scheduled notifications and the midnight sweep |
 | `app/api/` | Admin routes, one module per area |
@@ -390,6 +391,25 @@ means the hour between is not worked. Overlapping rows coalesce.
   `recalculate_queue` for the affected day, so customers already quoted the old
   hours get restated times rather than ones nobody will honour.
 
+
+### API
+| Route | Purpose |
+|---|---|
+| `GET /admin/agents/{id}/schedule` | weekly windows; `uses_tenant_hours` flags the fallback |
+| `PUT /admin/agents/{id}/schedule` | replace all — `{"windows":[{"weekday":0,"start_minute":480,"end_minute":1020}]}` |
+| `GET /admin/agents/{id}/blocks?from_date=` | upcoming time off |
+| `POST /admin/agents/{id}/blocks` | `{"starts_at":ISO,"ends_at":ISO,"reason":""}` |
+| `DELETE /admin/blocks/{id}` | remove one |
+| `GET /admin/agents/{id}/windows?queue_date=` | **the windows the engine actually uses** — the honest answer to "why was nobody booked at 14:00?" |
+
+`weekday` is 0 = Monday … 6 = Sunday (Python's `datetime.weekday()`). Times are
+minutes from midnight, 0–1440. `PUT` is replace-all rather than per-row because
+a half-applied schedule would silently take a working day off the board; an
+invalid window rejects the whole request and leaves the existing schedule
+intact.
+
+---
+
 ## Fixed appointments
 
 A queue entry's `estimated_start` is **derived**. `recalculate_queue` rewrites it
@@ -446,21 +466,52 @@ Three layers, because the first is allowed to fail:
 A flexible entry sitting in the time is *not* a conflict — it reschedules around
 the appointment, which is the entire meaning of fixed.
 
-### API
-| Route | Purpose |
-|---|---|
-| `GET /admin/agents/{id}/schedule` | weekly windows; `uses_tenant_hours` flags the fallback |
-| `PUT /admin/agents/{id}/schedule` | replace all — `{"windows":[{"weekday":0,"start_minute":480,"end_minute":1020}]}` |
-| `GET /admin/agents/{id}/blocks?from_date=` | upcoming time off |
-| `POST /admin/agents/{id}/blocks` | `{"starts_at":ISO,"ends_at":ISO,"reason":""}` |
-| `DELETE /admin/blocks/{id}` | remove one |
-| `GET /admin/agents/{id}/windows?queue_date=` | **the windows the engine actually uses** — the honest answer to "why was nobody booked at 14:00?" |
+### The customer's conversation
 
-`weekday` is 0 = Monday … 6 = Sunday (Python's `datetime.weekday()`). Times are
-minutes from midnight, 0–1440. `PUT` is replace-all rather than per-row because
-a half-applied schedule would silently take a working day off the board; an
-invalid window rejects the whole request and leaves the existing schedule
-intact.
+`mode = "appointments"` runs `app/appointments_flow.py`. Every state is prefixed
+`apt_`, so a tenant that switches mode mid-session can never land in a queue or
+ordering state.
+
+```
+menu → 1 book → day → service → person → time → confirm
+     → 2 my appointment
+     → 3 cancel
+```
+
+- **Day and time lists page.** A numbered list on WhatsApp stops being readable
+  around ten entries, and a clinic booking six weeks out would otherwise send a
+  wall of forty dates. `more` and `back` move a page; `0` steps back a screen.
+  `advance_days` governs the span, capped at 60.
+- **One person who can do the service is not a choice.** That screen is skipped
+  — and `0` from the time list then goes back to *services*, not to a screen
+  that would immediately re-skip itself and strand the customer on the times.
+- **"No preference" offers every time anybody can do**, once each. Which agent
+  takes it is settled at booking against live availability, by the same
+  shortest-backlog rule `assign_agent` uses.
+- **One live appointment per customer.** Said before they walk the whole flow,
+  not after — a second booking wastes a slot the shop could have sold.
+- **A time taken mid-conversation is reported, never papered over.** If somebody
+  confirms the same slot first, the second customer is told plainly and shown
+  what is left. They are never quietly given a different time.
+
+### Config
+
+| Field | Meaning |
+|---|---|
+| `mode` | `"appointments"` |
+| `slot_granularity_minutes` | the grid, default 30. Rejected outside 5–240 — a zero makes the engine offer nothing at all, silently |
+| `advance_days` | how far ahead customers may book |
+| `queue_opens` / `queue_closes` | the day's bounds; per-agent schedules narrow it from there |
+
+Services, agents, agent schedules and blocks all work exactly as they do for a
+queue tenant — an appointment tenant uses the same **Services**, **Agents** and
+**Reports** pages, and the same walk-in endpoint.
+
+### Migration
+
+`mode` defaults to `"queue"`, so nothing changes for a deployed tenant until
+someone picks the new mode on the dashboard. `slot_granularity_minutes` is added
+by `ADDED_COLUMNS` with a default of 30 and is ignored in every other mode.
 
 ---
 

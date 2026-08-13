@@ -34,6 +34,7 @@ class TenantCreate(SQLModel):
     mode:                   str = "queue"
     currency_symbol:        str = "R"
     kitchen_parallel_items: int = 4
+    slot_granularity_minutes: int = 30
 
 
 @router.get("/admin/tenants")
@@ -45,7 +46,20 @@ def list_tenants(user: User = Depends(get_current_user)):
         t = s.get(Tenant, user.tenant_id) if user.tenant_id else None
         return [t] if t else []
 
-MODES = ["queue", "orders"]
+MODES = ["queue", "orders", "appointments"]
+
+# A grid coarser than this is not a booking system, and one finer is unreadable
+# on WhatsApp. Guarded because a zero would make the slot engine offer nothing
+# at all, silently, for as long as it took someone to notice.
+MIN_GRANULARITY, MAX_GRANULARITY = 5, 240
+
+
+def _validate_granularity(value):
+    if not isinstance(value, int) or not (MIN_GRANULARITY <= value <= MAX_GRANULARITY):
+        raise HTTPException(
+            status_code=400,
+            detail=f"slot_granularity_minutes must be between "
+                   f"{MIN_GRANULARITY} and {MAX_GRANULARITY}")
 
 
 @router.post("/admin/tenants")
@@ -53,6 +67,7 @@ def create_tenant(data: TenantCreate, _: User = Depends(require_super)):
     if data.mode not in MODES:
         raise HTTPException(status_code=400,
                             detail=f"mode must be one of {', '.join(MODES)}")
+    _validate_granularity(data.slot_granularity_minutes)
     tenant = Tenant(**data.dict())
     with Session(engine) as s:
         s.add(tenant)
@@ -72,6 +87,8 @@ def update_tenant(tenant_id: int, updates: Dict[str, Any],
         if "mode" in updates and updates["mode"] not in MODES:
             raise HTTPException(status_code=400,
                                 detail=f"mode must be one of {', '.join(MODES)}")
+        if "slot_granularity_minutes" in updates:
+            _validate_granularity(updates["slot_granularity_minutes"])
         for k, v in updates.items():
             if hasattr(tenant, k):
                 setattr(tenant, k, v)
