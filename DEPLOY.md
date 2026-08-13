@@ -18,29 +18,54 @@
 | `requirements.txt` | Python dependencies |
 | `Dockerfile.bot` | Docker image for the bot — copies `main.py` **and** `app/` |
 | `src/` | React admin frontend source |
-| `Dockerfile.frontend` | Docker image for the admin UI |
+| `Dockerfile.frontend` | Docker image for the admin UI — bakes `VITE_API_URL` in at build time |
 | `nginx.conf` | SPA routing config for nginx |
+
+Deployed on **Railway**: two services built from the Dockerfiles above, plus
+Railway's Postgres and Redis. Both redeploy automatically on a push to `main`.
 
 ---
 
-## EasyPanel Setup — Two Services
+## Railway Setup
+
+One Railway project, four services: **bot**, **admin frontend**, **Postgres**,
+**Redis**. Both application services build from the Dockerfiles in this repo and
+redeploy automatically on every push to `main`.
+
+> **Deploys are automatic and unordered.** Merging to `main` rebuilds both
+> services at once, and there is no guarantee the bot finishes first. A frontend
+> that comes up ahead of a new endpoint shows 404s until the bot restart lands —
+> it resolves itself, but that is the explanation when a new page looks broken
+> for a minute after a merge.
 
 ### Service 1: Bot (main.py)
 
-1. Create a new **App** service called `whatsapp-bot`
-2. Set **Build**: Dockerfile → `Dockerfile.bot`
-3. Set **Port**: `9000`
-4. Add environment variables:
+1. **New Service → GitHub Repo →** this repository
+2. **Settings → Build → Dockerfile Path:** `Dockerfile.bot`
+3. **Settings → Networking → Generate Domain.** Railway reads `EXPOSE 9000` from
+   the Dockerfile and routes to that port.
+   - Railway also injects a `PORT` variable. **This app ignores it** — the
+     Dockerfile's `CMD` hardcodes `--port 9000`. That is consistent and works,
+     but if the target port is ever set by hand it must stay `9000`, or the
+     service will deploy successfully and answer nothing.
+4. **Variables:**
    ```
-   DATABASE_URL=postgres://postgres:<password>@<project>_booking-db:5432/whatsapp_bot
-   REDIS_URL=redis://default:<password>@<project>_evolution-api-redis:6379
+   DATABASE_URL=${{Postgres.DATABASE_URL}}   # reference variable, not a literal
+   REDIS_URL=${{Redis.REDIS_URL}}
    JWT_SECRET=<long-random-secret>           # REQUIRED — signs login tokens
    WEBHOOK_SECRET=<long-random-secret>       # REQUIRED — authenticates Evolution's /webhook calls
    SUPERADMIN_EMAIL=you@example.com          # your platform-operator login (seeded on boot)
    SUPERADMIN_PASSWORD=<strong-password>     # change after first login
-   ALLOWED_ORIGINS=https://your-admin-url.easypanel.host   # CORS allow-list (defaults to *)
+   ALLOWED_ORIGINS=https://<your-admin>.up.railway.app   # CORS allow-list (defaults to *)
    TZ=Africa/Johannesburg
    ```
+   - Use Railway's **reference variables** (`${{Postgres.DATABASE_URL}}`) rather
+     than pasting a connection string. A rotated database password then reaches
+     the bot on its own; a pasted literal goes stale silently and the bot fails
+     to boot at the worst moment.
+   - Railway's Postgres hands out a `postgresql://` URL. Older providers hand out
+     `postgres://`, which SQLAlchemy rejects — `app/config.py` rewrites that
+     prefix, so either form works.
    - `JWT_SECRET` **must be set** or auth returns `503`. Generate one e.g. `openssl rand -hex 32`.
    - `WEBHOOK_SECRET` **must be set.** If it is empty the bot still boots and takes
      bookings — so an existing deployment doesn't go silent on upgrade — but
@@ -52,27 +77,89 @@
    - `SUPERADMIN_EMAIL`/`SUPERADMIN_PASSWORD` seed your super-admin account on startup
      (only if it doesn't already exist). Without them, no one can log in.
    - `ALLOWED_ORIGINS` is comma-separated; set it to your admin URL in production instead of `*`.
-5. Deploy
+5. Deploy. Check `GET /health` on the generated domain — `"webhook_auth"` must
+   be `true`.
 
 6. Once live, log in to the admin frontend with your `SUPERADMIN_EMAIL` and
    register your first business from **Businesses → + Add Business**. There is
    no seed endpoint — tenants carry Evolution credentials, so they are created
    through an authenticated route only.
 
+**Replicas: keep this at one.** The scheduler runs inside the web process, so a
+second replica runs a second copy of the reminder sweep, the notification
+reconciler and the outbox drain. Nothing double-sends if it happens — every
+notification is claimed in `notification_log` and every message carries an
+outbox `dedupe_key`, both enforced by unique constraints in the database rather
+than by timing — but the duplicated work is pure waste, and one instance is the
+shape this is built for.
+
 ---
 
 ### Service 2: Admin Frontend (React)
 
-1. Create a new **App** service called `bookbot-admin`
-2. Set **Build**: Dockerfile → `Dockerfile.frontend`
-3. Set **Build Arg**:
+1. **New Service → GitHub Repo →** this repository (the same repo, a second service)
+2. **Settings → Build → Dockerfile Path:** `Dockerfile.frontend`
+3. **Variables:**
    ```
-   VITE_API_URL=https://your-bot-url.easypanel.host
+   VITE_API_URL=https://<your-bot>.up.railway.app
    ```
-4. Set **Port**: `80`
-5. Deploy
+   Railway exposes service variables to the Docker build, and `Dockerfile.frontend`
+   declares a matching `ARG VITE_API_URL`.
 
-6. Open `https://your-admin-url.easypanel.host` — you should see the dashboard.
+   > **This one is baked in at build time, not read at runtime.** Vite compiles
+   > it into the bundle. Changing the variable does nothing until the service is
+   > rebuilt, and `Dockerfile.frontend` carries a hardcoded fallback pointing at
+   > the old EasyPanel host — so a frontend built without this variable set will
+   > deploy cleanly, load fine, and silently talk to a dead server. If the
+   > dashboard shows no data and the browser console shows failed requests to a
+   > host you don't recognise, this is why.
+
+4. **Settings → Networking → Generate Domain.** Railway reads `EXPOSE 80` from
+   the Dockerfile; nginx listens on 80 and serves the SPA.
+5. Deploy, then open the generated domain — you should see the login screen.
+6. Add that domain to the bot's `ALLOWED_ORIGINS`, then redeploy the bot.
+
+---
+
+### Services 3 and 4: Postgres and Redis
+
+**New Service → Database → Add PostgreSQL**, and the same for **Redis**. No
+configuration beyond that; the bot reaches them through the reference variables
+above, over Railway's private network.
+
+**Postgres is not optional.** Every booking, tenant and message lives there.
+
+**Redis is close to optional, and fails in a way worth knowing.** It holds two
+things: the conversation session store, and the booking lock. If it is gone or
+unreachable:
+
+- `booking_lock` **degrades open** — deliberately. Bookings keep working, and
+  two landing in the same instant can pick the same agent. The partial unique
+  index `uq_queueentry_agent_slot` is what still stops an appointment being
+  double-booked, and it is enforced by the database, not by Redis.
+- Conversations lose their place mid-flow. A customer halfway through picking a
+  time starts again.
+
+So a Redis outage degrades the product rather than corrupting it. See
+[Booking lock](#booking-lock).
+
+### Schema changes on deploy
+
+There is no migration step to run. `create_db_and_tables()` runs on boot and:
+
+1. creates any missing table,
+2. applies `ADDED_COLUMNS` — additive `ALTER TABLE` statements, each guarded by
+   an `information_schema` check,
+3. builds the indexes in `INDEXES` and `UNIQUE_INDEXES`, **after** the column
+   additions, so an index over a newly added column can actually be built,
+4. runs `backfill_notification_log()`, which seeds `notification_log` from the
+   two boolean columns it replaced. Without it, every customer already warned
+   before that shipped would be warned again on the first tick after deploy.
+
+Every step is additive and idempotent. Nothing is dropped, renamed or
+backfilled destructively, so a redeploy of an older image finds a database it
+still understands — the columns it does not know about are simply unread. That
+is what makes Railway's automatic deploys safe here.
 
 ---
 
