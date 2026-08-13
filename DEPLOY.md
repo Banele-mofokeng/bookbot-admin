@@ -107,12 +107,13 @@ shape this is built for.
    declares a matching `ARG VITE_API_URL`.
 
    > **This one is baked in at build time, not read at runtime.** Vite compiles
-   > it into the bundle. Changing the variable does nothing until the service is
-   > rebuilt, and `Dockerfile.frontend` carries a hardcoded fallback pointing at
-   > the old EasyPanel host — so a frontend built without this variable set will
-   > deploy cleanly, load fine, and silently talk to a dead server. If the
-   > dashboard shows no data and the browser console shows failed requests to a
-   > host you don't recognise, this is why.
+   > it into the bundle, so changing the variable does nothing until the service
+   > is rebuilt.
+   >
+   > `Dockerfile.frontend` has no fallback and **fails the build** if this is
+   > missing, rather than shipping a bundle that loads perfectly and talks to
+   > nothing. A failed build costs a deploy; the running container keeps serving
+   > until a good one replaces it.
 
 4. **Settings → Networking → Generate Domain.** Railway reads `EXPOSE 80` from
    the Dockerfile; nginx listens on 80 and serves the SPA.

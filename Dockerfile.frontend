@@ -5,8 +5,21 @@ RUN npm ci
 COPY . .
 RUN chmod +x ./node_modules/.bin/vite
 
-# Hardcode your bot URL here as a fallback
-ARG VITE_API_URL=https://whatsapp-bot-whatsapp-bot.a8x5ve.easypanel.host
+# The bot's public URL. Vite compiles this into the bundle, so it is fixed at
+# build time and a later change to the variable does nothing until a rebuild.
+#
+# No default, and the build stops if it is missing. A default is worse than it
+# looks here: the bundle would build cleanly, the container would serve, the
+# dashboard would load, and every request would go to whatever host the default
+# named — a failure that shows up as an empty dashboard rather than as an error.
+# Failing during the build costs a deploy; the old container keeps serving until
+# a good one replaces it.
+ARG VITE_API_URL
+RUN test -n "$VITE_API_URL" || { \
+      echo "VITE_API_URL is not set. Set it as a variable on this service — it is" >&2; \
+      echo "baked into the bundle at build time. See DEPLOY.md, Service 2."       >&2; \
+      exit 1; \
+    }
 ENV VITE_API_URL=$VITE_API_URL
 RUN npx --no-install vite build
 
