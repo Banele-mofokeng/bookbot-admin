@@ -184,6 +184,149 @@ def _fire_youre_next(tenant_id: int, agent_id: int, queue_date: str):
     _claim_notification(entry_id, RULE_TWO_AWAY)
     send_text(tenant, notify_to, body, dedupe_key=f"{RULE_YOURE_NEXT}:{entry_id}")
 
+# =============================================================================
+# APPOINTMENT REMINDERS
+# =============================================================================
+# Derived from state on every tick, exactly like the queue's 15-minute warning
+# and for the same reason: there is no persisted timer, so a restart, a crash or
+# a missed tick cannot lose a reminder.
+
+def reminder_rungs(offsets: list, start: datetime) -> list:
+    """
+    Each configured offset paired with the span during which it is still the
+    truthful thing to say: [(offset_minutes, due_from, due_until)].
+
+    Two things close that window, and the earlier one wins.
+
+    The next rung taking over. Once "in about two hours" is due, "tomorrow" has
+    nothing left to say.
+
+    Its own lateness budget — half its lead time. A rung's message is worded
+    from its nominal offset, so how late it may go out is bounded by when that
+    wording stops being true: "your appointment is tomorrow" survives eleven
+    hours of outage and is absurd twenty-three hours late, by which point the
+    appointment is today. Without this, switching reminders on with a full diary
+    would send every customer a day-ahead notice for appointments starting
+    within the hour, because the day-ahead rung stays open until T-2h.
+
+    A rung whose whole window is missed is not sent late. It is skipped, and
+    the next rung says something true instead.
+    """
+    rungs = []
+    for i, offset in enumerate(offsets):
+        due_from  = start - timedelta(minutes=offset)
+        next_rung = (start - timedelta(minutes=offsets[i + 1])
+                     if i + 1 < len(offsets) else start)
+        grace = max(offset * config.REMINDER_GRACE_FRACTION,
+                    config.REMINDER_MIN_GRACE_MINUTES)
+        rungs.append((offset, due_from,
+                      min(next_rung, due_from + timedelta(minutes=grace))))
+    return rungs
+
+
+def _due_rung(offsets: list, start: datetime, now: datetime):
+    """The rung that is currently truthful, or None."""
+    for offset, due_from, due_until in reminder_rungs(offsets, start):
+        if due_from <= now < due_until:
+            return offset
+    return None
+
+
+def _within_business_hours(tenant: Tenant, when: datetime) -> bool:
+    """
+    Reminders go out during the business's own day, never at 03:00.
+
+    A rung stays due until the next one takes over, so one that comes due
+    overnight simply goes out when the shop opens. Only a rung whose entire
+    window sits outside opening hours is lost — which takes a deliberately odd
+    configuration, and losing it beats waking a customer.
+    """
+    return tenant.queue_opens <= when.hour < tenant.queue_closes
+
+
+def _reminder_body(tenant: Tenant, entry: QueueEntry, offset: int,
+                   service_name: str, agent_name: str) -> str:
+    return (
+        f"⏰ *Reminder — {tenant.business_name}*\n\n"
+        f"Your appointment is {core.describe_gap(offset)}.\n\n"
+        f"📅 {entry.queue_date}\n"
+        f"🕐 {format_eta(entry.estimated_start)}"
+        f"{f' – {format_eta(entry.slot_end)}' if entry.slot_end else ''}\n"
+        f"💼 {service_name}\n"
+        f"👤 {tenant.agent_label}: {agent_name}\n\n"
+        f"Reply *3* if you can no longer make it."
+    )
+
+
+def reminder_sweep() -> int:
+    """
+    Send any appointment reminder that has come due. Returns how many.
+
+    Only fixed entries — a queue entry has no promised time to remind anyone
+    about, and keeps the 15-minute warning it already had. Nothing here changes
+    for a queue or ordering tenant.
+    """
+    now = core.now()
+    due = []
+
+    with Session(engine) as s:
+        entries = s.exec(
+            select(QueueEntry).where(
+                QueueEntry.is_fixed   == True,
+                QueueEntry.status     == "Waiting",
+                QueueEntry.queue_date >= core.today_str(),
+            )
+        ).all()
+        if not entries:
+            return 0
+
+        tenants = {
+            t.id: t for t in s.exec(
+                select(Tenant).where(
+                    Tenant.id.in_({e.tenant_id for e in entries})
+                )
+            ).all()
+        }
+
+        for entry in entries:
+            tenant = tenants.get(entry.tenant_id)
+            if not tenant or not entry.estimated_start:
+                continue
+            offsets = core.parse_reminder_offsets(tenant.reminder_offsets_minutes)
+            if not offsets:
+                continue
+            offset = _due_rung(offsets, entry.estimated_start, now)
+            if offset is None:
+                continue
+            if not _within_business_hours(tenant, now):
+                continue
+
+            rule = f"reminder:{offset}"
+            if _already_notified(s, entry.id, rule):
+                continue
+            notify_to = get_notify_number(entry)
+            if not notify_to:
+                continue
+
+            service = s.get(Service, entry.service_id)
+            agent   = s.get(Agent, entry.agent_id)
+            due.append((
+                tenant, entry.id, rule, notify_to,
+                _reminder_body(tenant, entry, offset,
+                               service.name if service else "",
+                               agent.name if agent else tenant.agent_label),
+            ))
+
+    fired = 0
+    for tenant, entry_id, rule, notify_to, body in due:
+        # Claim before queueing, so two workers cannot both send it.
+        if not _claim_notification(entry_id, rule):
+            continue
+        send_text(tenant, notify_to, body, dedupe_key=f"{rule}:{entry_id}")
+        fired += 1
+    return fired
+
+
 def _sweep_stale_orders(today: str) -> int:
     """
     Cancel every unclosed order from a day before today. Returns how many.

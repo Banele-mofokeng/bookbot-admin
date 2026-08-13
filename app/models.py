@@ -45,6 +45,11 @@ class Tenant(SQLModel, table=True):
     # for a customer to read and for a calendar to draw. A service longer than
     # one step simply consumes several.
     slot_granularity_minutes: int = 30
+    # Minutes before an appointment to send a reminder, largest first. Two by
+    # default — a day ahead so the customer can move it, and two hours ahead so
+    # they actually leave. A third rung is a setting, not a rewrite. Empty
+    # switches reminders off for this business.
+    reminder_offsets_minutes: str = "1440,120"
 
 
 class User(SQLModel, table=True):

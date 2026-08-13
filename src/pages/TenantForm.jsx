@@ -21,6 +21,7 @@ const EMPTY = {
   currency_symbol:          'R',
   kitchen_parallel_items:   4,
   slot_granularity_minutes: 30,
+  reminder_offsets_minutes: '1440,120',
 }
 
 function Field({ label, hint, error, children }) {
@@ -286,11 +287,17 @@ export default function TenantForm({ tenants, reload }) {
             </div>
 
             {isAppointments && (
-              <div style={{ marginTop: 16, maxWidth: 260 }}>
+              <div className="form-page-grid-2" style={{ marginTop: 16, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
                 <Field label="Slot Every (min)"
                   hint="The grid times land on. 30 offers 09:00, 09:30, 10:00. A longer service simply uses several.">
                   <NumberInput value={form.slot_granularity_minutes}
                     onChange={setNum('slot_granularity_minutes')} min={5} max={240} />
+                </Field>
+                <Field label="Reminders (min before)"
+                  hint="Minutes before the appointment. 1440,120 = a day ahead and two hours ahead. Blank turns reminders off.">
+                  <TextInput value={form.reminder_offsets_minutes}
+                    onChange={setText('reminder_offsets_minutes')}
+                    placeholder="1440,120" />
                 </Field>
               </div>
             )}

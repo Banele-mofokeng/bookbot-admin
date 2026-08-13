@@ -128,6 +128,7 @@ TENANT_COLUMNS = [
     ("currency_symbol",        "VARCHAR DEFAULT 'R'"),
     ("kitchen_parallel_items", "INTEGER DEFAULT 4"),
     ("slot_granularity_minutes", "INTEGER DEFAULT 30"),
+    ("reminder_offsets_minutes", "VARCHAR DEFAULT '1440,120'"),
 ]
 
 ADDED_COLUMNS = {

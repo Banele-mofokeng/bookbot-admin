@@ -49,6 +49,47 @@ def format_eta(dt: Optional[datetime]) -> str:
     return dt.strftime("%H:%M")
 
 
+def parse_reminder_offsets(raw: str) -> list:
+    """
+    "1440,120" → [1440, 120]. Minutes before an appointment, largest first.
+
+    Duplicates, blanks, zero, negatives and anything unparseable are dropped
+    rather than raising: this reads a tenant's configuration on a hot path, and
+    one bad character in a settings field must not stop every other tenant's
+    reminders. An empty result switches reminders off for that tenant, which is
+    the honest reading of a setting nobody can make sense of — the dashboard
+    rejects a bad value at the point somebody types it.
+    """
+    out = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            minutes = int(part)
+        except ValueError:
+            continue
+        if minutes > 0:
+            out.add(minutes)
+    return sorted(out, reverse=True)
+
+
+def describe_gap(minutes: int) -> str:
+    """
+    How far off something is, in the words a person would use. Drives the
+    reminder's opening line, so 1440 reads "tomorrow" and not "in 1440 minutes".
+    """
+    if minutes >= 2880:
+        return f"in {round(minutes / 1440)} days"
+    if minutes >= 1440:
+        return "tomorrow"
+    if minutes >= 120:
+        return f"in about {round(minutes / 60)} hours"
+    if minutes >= 60:
+        return "in about an hour"
+    return f"in {minutes} minutes"
+
+
 def format_money(cents: int, symbol: str = "R") -> str:
     """Money for humans. Whole amounts lose the ".00" — a menu reads R45, not
     R45.00, and a till slip still needs the cents when there are any."""
