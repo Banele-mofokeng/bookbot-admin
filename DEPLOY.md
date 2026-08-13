@@ -390,6 +390,62 @@ means the hour between is not worked. Overlapping rows coalesce.
   `recalculate_queue` for the affected day, so customers already quoted the old
   hours get restated times rather than ones nobody will honour.
 
+## Fixed appointments
+
+A queue entry's `estimated_start` is **derived**. `recalculate_queue` rewrites it
+whenever anything ahead of it moves, which is correct for a queue and wrong for
+a booked time. `queueentry.is_fixed` says this start is a **promise**:
+
+- Fixed entries are never rewritten. Instead they are cut out of the agent's
+  working windows, so flexible work is scheduled *around* them.
+- `slot_end` is written once at booking. Retiming a service tomorrow must not
+  move an appointment promised today.
+- Fixed entries take no part in backlog. A 16:00 booking is not queued work at
+  09:00; counting it would quote a walk-in a seven-hour wait for an empty shop,
+  and would make every agent with an afternoon booking look busy to
+  `assign_agent` all morning.
+- The gaps *between* appointments stay bookable, which is what lets one shop run
+  booked times and people off the street on the same day.
+
+The single thing this rests on: a fixed entry must never travel through the
+scheduling loop. Entries are placed in `joined_at` order, and an appointment
+booked last week has the earliest `joined_at` of anyone in the shop — treated as
+a queue position it would advance the agent's clock to 14:45 before this
+morning's walk-in is even considered.
+
+### Slots
+`tenant.slot_granularity_minutes` (default 30) is the grid offered times land
+on: 09:00, 09:30, 10:00. A service longer than one step consumes several, and a
+candidate whose service would run past the end of its window is dropped rather
+than allowed to spill into a break.
+
+The grid is anchored to the **shift**, never to the fragments a day's bookings
+leave behind. `list_free_slots` takes working windows plus a list of occupied
+intervals — it does not take pre-carved free windows. Subtracting a 10:00–10:45
+appointment first would leave a window starting at 10:45, and since the grid
+restarts at each window, the rest of the day would be offered as 10:45 and 11:15
+instead of 11:00 and 11:30.
+
+A slot is only offerable if the *whole service* fits. With 10:00–10:45 booked, a
+45-minute service cannot start at 09:30 even though 09:30 itself is free.
+
+### Not booking one chair twice
+Three layers, because the first is allowed to fail:
+
+1. `booking_lock` serialises bookings per tenant per date — but it **degrades
+   open** when Redis is unreachable, by design. For a queue that costs a
+   mis-assignment staff can fix. For an appointment it would cost two people
+   sent to one chair.
+2. An overlap check inside the transaction. This is what catches a *partial*
+   overlap — 10:00 for 45 minutes against a 10:30 booking.
+3. `uq_queueentry_agent_slot`, a unique partial index on `(agent_id,
+   estimated_start)` over live fixed rows. **This is the layer that still holds
+   when Redis is down**, and the reason `reserve_appointment` is the only
+   supported way to write a fixed entry.
+
+A flexible entry sitting in the time is *not* a conflict — it reschedules around
+the appointment, which is the entire meaning of fixed.
+
 ### API
 | Route | Purpose |
 |---|---|

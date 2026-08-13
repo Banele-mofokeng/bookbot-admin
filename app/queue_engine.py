@@ -5,12 +5,14 @@ import math
 import re
 from datetime import datetime, timedelta, time, date
 from typing import Optional, Dict, Any, List
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app import core
 from app.db import engine
 from app.models import (Tenant, Service, Agent, AgentService, AgentSchedule,
                         AgentBlock, QueueEntry)
+from app.sessions import booking_lock
 
 # =============================================================================
 # 6. QUEUE ENGINE
@@ -131,6 +133,163 @@ def get_working_windows(tenant: Tenant, agent_id: int, queue_date: str) -> List:
     return get_working_windows_for([agent_id], tenant, queue_date).get(agent_id, [])
 
 
+# ── Fixed appointments ───────────────────────────────────────────────────────
+# A fixed entry's start is a promise, not a derivation. The queue is scheduled
+# *around* those promises: they are subtracted from the working windows exactly
+# as a block is, so nothing flexible is ever quoted on top of one — and the gaps
+# between them stay available, which is what lets a walk-in fill the 45 minutes
+# between a 09:00 and a 10:30 appointment.
+
+def _entry_end(entry: QueueEntry, services: Dict[int, Service]) -> Optional[datetime]:
+    """
+    When this entry releases its agent.
+
+    A fixed entry carries its own slot_end, frozen at booking. Everything else
+    is start plus whatever the service takes today.
+    """
+    if not entry.estimated_start:
+        return None
+    if entry.is_fixed and entry.slot_end:
+        return entry.slot_end
+    svc = services.get(entry.service_id)
+    return entry.estimated_start + timedelta(minutes=svc.duration_minutes if svc else 60)
+
+
+def get_fixed_intervals(agent_id: int, tenant_id: int, queue_date: str,
+                        exclude_entry_id: Optional[int] = None) -> List:
+    """Occupied (start, end) pairs for this agent's fixed appointments."""
+    with Session(engine) as s:
+        entries = s.exec(
+            select(QueueEntry).where(
+                QueueEntry.agent_id   == agent_id,
+                QueueEntry.tenant_id  == tenant_id,
+                QueueEntry.queue_date == queue_date,
+                QueueEntry.is_fixed   == True,
+                QueueEntry.status.in_(["Waiting", "InService"]),
+            )
+        ).all()
+        services = _service_map(s, entries)
+    out = []
+    for e in entries:
+        if exclude_entry_id and e.id == exclude_entry_id:
+            continue
+        end = _entry_end(e, services)
+        if e.estimated_start and end:
+            out.append((e.estimated_start, end))
+    return _merge_windows(out)
+
+
+def get_free_windows(tenant: Tenant, agent_id: int, queue_date: str,
+                     exclude_entry_id: Optional[int] = None) -> List:
+    """
+    Working windows with every fixed appointment cut out of them.
+
+    This is what flexible work — walk-ins, ordinary queue entries — is placed
+    into. Using the raw working windows instead would quote someone straight
+    over a booked appointment.
+    """
+    return _subtract_windows(
+        get_working_windows(tenant, agent_id, queue_date),
+        get_fixed_intervals(agent_id, tenant.id, queue_date, exclude_entry_id),
+    )
+
+
+def list_free_slots(windows: List, booked: List, duration_minutes: int,
+                    granularity_minutes: int,
+                    floor: Optional[datetime] = None,
+                    limit: Optional[int] = None) -> List:
+    """
+    Every start time on the grid where `duration_minutes` fits, in order.
+
+    Pure — no queries — so it can be tested exhaustively and reused for any
+    agent. `place_in_windows` answers "when is the earliest?"; this answers
+    "what may I offer?", which is the whole difference between a queue and a
+    booked appointment.
+
+    Candidates step by `granularity_minutes` from the start of each window, so
+    offered times land on a grid a customer can read and a calendar can draw:
+    09:00, 09:30, 10:00. A service longer than one step consumes several, and a
+    candidate whose service would run past the end of its window is dropped
+    rather than allowed to spill into a break the agent actually takes.
+
+    `booked` is any list of (start, end) intervals to avoid — appointments
+    already taken, and flexible work already scheduled.
+    """
+    if duration_minutes <= 0 or granularity_minutes <= 0:
+        return []
+
+    need = timedelta(minutes=duration_minutes)
+    step = timedelta(minutes=granularity_minutes)
+    taken = _merge_windows(booked)
+    out: List = []
+
+    for w_start, w_end in windows:
+        candidate = w_start
+        while candidate + need <= w_end:
+            if floor and candidate < floor:
+                candidate += step
+                continue
+            # Half-open intervals: an appointment ending at 10:45 leaves 10:45
+            # free, which is the difference between offering a slot and losing
+            # one on every boundary.
+            if not any(candidate < b_end and candidate + need > b_start
+                       for b_start, b_end in taken):
+                out.append(candidate)
+                if limit and len(out) >= limit:
+                    return out
+            candidate += step
+    return out
+
+
+def get_free_slots(tenant: Tenant, agent_id: int, queue_date: str,
+                   duration_minutes: int, floor: Optional[datetime] = None,
+                   limit: Optional[int] = None) -> List:
+    """
+    Bookable start times for one agent on one date.
+
+    Both kinds of work are avoided — fixed appointments and flexible entries
+    alike. A salon running both must not offer 10:00 to an appointment when a
+    walk-in is already mid-cut.
+
+    Both are passed as *booked intervals* rather than subtracted from the
+    windows, which matters more than it looks. Carving a 10:00-10:45
+    appointment out of a 09:00-12:00 shift would leave a window starting at
+    10:45, and the grid restarts at each window start — so the day would go on
+    offering 10:45 and 11:15 instead of 11:00 and 11:30. The grid has to be
+    anchored to the shift the agent actually works, not to the fragments
+    today's bookings happen to leave behind. Working windows in, everything
+    occupied as intervals.
+
+    `floor` defaults to now, so today never offers a time that has passed.
+    """
+    windows = get_working_windows(tenant, agent_id, queue_date)
+    booked  = list(get_fixed_intervals(agent_id, tenant.id, queue_date))
+
+    with Session(engine) as s:
+        flexible = s.exec(
+            select(QueueEntry).where(
+                QueueEntry.agent_id   == agent_id,
+                QueueEntry.tenant_id  == tenant.id,
+                QueueEntry.queue_date == queue_date,
+                QueueEntry.is_fixed   == False,
+                QueueEntry.status.in_(["Waiting", "InService"]),
+            )
+        ).all()
+        services = _service_map(s, flexible)
+
+    for e in flexible:
+        end = _entry_end(e, services)
+        if e.estimated_start and end:
+            booked.append((e.estimated_start, end))
+
+    return list_free_slots(
+        windows, booked, duration_minutes,
+        tenant.slot_granularity_minutes,
+        floor=core.now() if floor is None else floor,
+        limit=limit,
+    )
+
+
 def place_in_windows(windows: List, floor: datetime,
                      duration_minutes: int) -> Optional[datetime]:
     """
@@ -177,10 +336,19 @@ def _backlog_from_entries(entries, services: Dict[int, Service],
     Backlog in minutes for one already-fetched list of entries. Pure — no
     queries — so callers that need several agents' backlogs can fetch once
     and call this per agent.
+
+    Fixed appointments are not backlog. Backlog answers "how long until this
+    agent finishes what is queued", and a 16:00 appointment is not queued work
+    at 09:00 — counting it would tell a walk-in standing in the shop that the
+    wait is seven hours, and would make every stylist with an afternoon booking
+    look busy to assign_agent all morning. The appointment is still respected:
+    it comes out of the working windows, so nothing is ever placed on top of it.
     """
     total = 0
     for e in entries:
         if exclude_entry_id and e.id == exclude_entry_id:
+            continue
+        if e.is_fixed:
             continue
         svc = services.get(e.service_id)
         if not svc:
@@ -264,8 +432,9 @@ def calculate_estimated_start(tenant: Tenant, agent_id: int,
     Uses max(queue_opens, now) as the base so backlog is always added to
     the correct anchor — preventing stale opens-time calculations mid-day.
 
-    The result is then snapped forward into the agent's next working window, so
-    a quote never lands in a lunch break or on a day off. If it lands past the
+    The result is then snapped forward into the agent's next free window, so a
+    quote never lands in a lunch break, on a day off, or on top of an
+    appointment somebody has already been promised. If it lands past the
     agent's last window the raw time is returned unchanged: the day is over-
     subscribed, and an honest after-hours ETA beats pretending otherwise.
     """
@@ -278,7 +447,7 @@ def calculate_estimated_start(tenant: Tenant, agent_id: int,
     if earliest_arrival:
         result = max(result, earliest_arrival)
 
-    windows = get_working_windows(tenant, agent_id, queue_date)
+    windows = get_free_windows(tenant, agent_id, queue_date)
     snapped = place_in_windows(windows, result, 0)
     return snapped or result
 
@@ -382,14 +551,32 @@ def recalculate_queue(tenant_id: int, agent_id: int, queue_date: str):
         ).all()
 
         services = _service_map(s, entries)
-        windows = get_working_windows(tenant, agent_id, queue_date)
         current_time = core.now()
         opens = datetime.strptime(
             f"{queue_date} {tenant.queue_opens:02d}:00", "%Y-%m-%d %H:%M"
         )
+
+        # Fixed appointments are obstacles in the day, not places in the queue.
+        # They must not go through the loop below: entries are walked in
+        # joined_at order, and an appointment booked last week for 14:00 has the
+        # earliest joined_at of anyone. Letting it advance next_free would push
+        # this morning's 09:00 walk-in to 14:45. Subtracting it from the windows
+        # instead pins its own time and leaves the gaps around it bookable.
+        fixed    = [e for e in entries if e.is_fixed]
+        flexible = [e for e in entries if not e.is_fixed]
+        blocked  = []
+        for e in fixed:
+            end = _entry_end(e, services)
+            if e.estimated_start and end:
+                blocked.append((e.estimated_start, end))
+        windows = _subtract_windows(
+            get_working_windows(tenant, agent_id, queue_date),
+            _merge_windows(blocked),
+        )
+
         # next_free tracks the absolute datetime when the agent becomes free
         next_free = max(opens, current_time)
-        for entry in entries:
+        for entry in flexible:
             svc = services.get(entry.service_id)
             duration = svc.duration_minutes if svc else 60
 
@@ -426,6 +613,106 @@ def recalculate_queue(tenant_id: int, agent_id: int, queue_date: str):
             s.add(e)
 
         s.commit()
+
+
+def slot_is_taken(s: Session, agent_id: int, tenant_id: int, queue_date: str,
+                  start: datetime, end: datetime,
+                  exclude_entry_id: Optional[int] = None) -> bool:
+    """
+    Whether this agent is already promised to any part of [start, end).
+
+    Only fixed appointments count. Flexible work — a walk-in mid-cut, an
+    ordinary queue entry — is not a conflict: it reschedules around
+    appointments, which is the entire point of calling them fixed.
+    """
+    rows = s.exec(
+        select(QueueEntry).where(
+            QueueEntry.agent_id   == agent_id,
+            QueueEntry.tenant_id  == tenant_id,
+            QueueEntry.queue_date == queue_date,
+            QueueEntry.is_fixed   == True,
+            QueueEntry.status.in_(["Waiting", "InService"]),
+        )
+    ).all()
+    for e in rows:
+        if exclude_entry_id and e.id == exclude_entry_id:
+            continue
+        e_start, e_end = e.estimated_start, e.slot_end
+        if e_start and e_end and e_start < end and e_end > start:
+            return True
+    return False
+
+
+def reserve_appointment(tenant: Tenant, agent_id: int, service_id: int,
+                        queue_date: str, start: datetime,
+                        customer_number: str, customer_name: str,
+                        duration_minutes: Optional[int] = None,
+                        booked_via: str = "whatsapp",
+                        customer_phone: str = "",
+                        earliest_arrival: Optional[datetime] = None) -> Optional[int]:
+    """
+    Book one fixed slot. Returns the new entry id, or None if the slot went to
+    somebody else first.
+
+    Three layers stand between two customers and the same chair, because the
+    first of them is allowed to fail:
+
+      1. booking_lock serialises bookings for this tenant and date — but it
+         degrades open when Redis is unreachable, by deliberate design. For a
+         queue that costs a mis-assignment staff can see and fix. For an
+         appointment it would cost two people sent to one chair at one time.
+      2. An overlap check inside the transaction. This is what catches a
+         partial overlap — 10:00 for 45 minutes against a 10:30 booking —
+         which a same-start constraint cannot see.
+      3. uq_queueentry_agent_slot, a unique index over live fixed rows. This is
+         the layer that still holds when Redis is down and layer 1 is not
+         really there.
+
+    The slot's end is written to slot_end now, from the service's duration as
+    it stands today. Retiming that service tomorrow must not move an
+    appointment already promised.
+    """
+    if duration_minutes is None:
+        with Session(engine) as s:
+            svc = s.get(Service, service_id)
+        duration_minutes = svc.duration_minutes if svc else 60
+    end = start + timedelta(minutes=duration_minutes)
+
+    with booking_lock(tenant.id, queue_date):
+        with Session(engine) as s:
+            if slot_is_taken(s, agent_id, tenant.id, queue_date, start, end):
+                return None
+            entry = QueueEntry(
+                tenant_id        = tenant.id,
+                service_id       = service_id,
+                agent_id         = agent_id,
+                customer_number  = customer_number,
+                customer_name    = customer_name,
+                customer_phone   = customer_phone,
+                queue_date       = queue_date,
+                estimated_start  = start,
+                slot_end         = end,
+                is_fixed         = True,
+                # An appointment is its own declared arrival — the customer
+                # said they would be there at this time by choosing it.
+                earliest_arrival = earliest_arrival or start,
+                booked_via       = booked_via,
+            )
+            s.add(entry)
+            try:
+                s.commit()
+            except IntegrityError:
+                # Layer 3 fired: somebody committed this exact start between
+                # our check and our insert.
+                s.rollback()
+                return None
+            s.refresh(entry)
+            entry_id = entry.id
+
+        # Flexible work now has to move around the new appointment.
+        recalculate_queue(tenant.id, agent_id, queue_date)
+
+    return entry_id
 
 
 def cancel_party(tenant_id: int, entry_id: int) -> List[int]:
@@ -486,6 +773,12 @@ def find_walkin_insert_joined_at(
     Used by both walk-ins (new_arrival=None → can start immediately) and
     WhatsApp joiners (new_arrival = their declared arrival time).
 
+    Fixed appointments take no part in this walk. They are not queue work to
+    accumulate behind, and their time is already carved out of the windows, so
+    the gap between a 09:00 and a 10:30 appointment is simply free space the
+    placement below can land in — which is the whole of what makes walk-ins and
+    appointments coexist in one shop.
+
     Returns None if the new entry should go at the end of the queue as usual.
     """
     with Session(engine) as s:
@@ -503,7 +796,8 @@ def find_walkin_insert_joined_at(
         if not walk_in_svc:
             return None
         walk_in_duration = walk_in_svc.duration_minutes
-        windows = get_working_windows(tenant, assigned_agent_id, queue_date)
+        windows = get_free_windows(tenant, assigned_agent_id, queue_date)
+        entries = [e for e in entries if not e.is_fixed]
 
         opens = datetime.strptime(
             f"{queue_date} {tenant.queue_opens:02d}:00", "%Y-%m-%d %H:%M"
