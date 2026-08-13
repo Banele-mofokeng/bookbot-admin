@@ -81,6 +81,11 @@ export const api = {
   updateStatus:  (entryId, status) => request(`/admin/queue/${entryId}/status`, { method: 'PATCH', body: JSON.stringify({ status }) }),
   addWalkin:     (data)     => request('/admin/queue/walkin', { method: 'POST', body: JSON.stringify(data) }),
 
+  // The same day as a calendar: working hours per agent, with the work already
+  // placed inside them. Answers "where are the gaps?", which the queue list
+  // cannot — a free hour is the absence of a row.
+  getTimeline:   (tenantId, date) => request(`/admin/timeline/${tenantId}${date ? `?queue_date=${date}` : ''}`),
+
   // Menu (ordering tenants) — prices are in cents everywhere
   getMenu:        (tenantId) => request(`/admin/menu/${tenantId}`),
   createMenuItem: (data)     => request('/admin/menu', { method: 'POST', body: JSON.stringify(data) }),

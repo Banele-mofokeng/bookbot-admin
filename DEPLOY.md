@@ -552,8 +552,50 @@ because a silent switch-off would not be noticed until a customer failed to
 arrive.
 
 Services, agents, agent schedules and blocks all work exactly as they do for a
-queue tenant — an appointment tenant uses the same **Services**, **Agents** and
-**Reports** pages, and the same walk-in endpoint.
+queue tenant — an appointment tenant uses the same **Services**, **Agents**,
+**Calendar** and **Reports** pages, and the same walk-in endpoint.
+
+### The calendar
+
+`GET /admin/timeline/{tenant_id}?queue_date=YYYY-MM-DD` — the day laid out per
+agent: the hours each one works, and the work already placed inside them. The
+**Calendar** page draws it as a column per agent on one shared time axis.
+
+The queue list answers *who is next?*. This answers *where are the gaps?*, which
+is what a shop taking booked appointments actually asks and what a table cannot
+show — a free hour is the absence of a row, and absence is not drawable in a
+list.
+
+| Field | Meaning |
+|---|---|
+| `day_start` / `day_end` | the shared axis, floored and ceiled to the hour. Widened to cover anything scheduled outside the working hours, because an overrun is exactly what someone opens this view to find |
+| `agents[].windows` | what the engine schedules into — schedule resolved for the weekday, blocks already subtracted. The same answer `/admin/agents/{id}/windows` gives, for every agent at once |
+| `agents[].entries` | placed work, in time order, each with `start`, `end`, `minutes` and `is_fixed` |
+| `agents[].working_minutes` / `booked_minutes` / `free_minutes` | the day's load. Free time is clamped at zero — a block dropped on top of an existing booking leaves more booked than worked |
+| `agents[].unplaced` | entries with no time. Nothing should reach this state; if something does it is named rather than dropped |
+| `orphaned` | entries whose agent row no longer exists, for the same reason |
+
+Batched like the queue read: windows for every agent in three queries and one
+service lookup, so the cost does not grow per agent.
+
+Two rules the view keeps to:
+
+- **Cancelled and no-show entries are not drawn.** They gave their time back.
+  Drawing them would show the day as fuller than it is, which is the one thing a
+  calendar must never do. `Done` stays — the morning is still worth seeing in
+  the afternoon.
+- **A fixed entry is drawn at the length it was booked at**, from `slot_end`,
+  not from today's `Service.duration_minutes`. Retiming a service must not
+  silently redraw an appointment somebody was already promised.
+
+Overlapping blocks are laid out side by side rather than stacked. Nothing should
+ever overlap — the engine schedules around fixed slots — so that layout exists
+to make a scheduling bug visible, not to look tidy.
+
+Not appointment-only: a queue tenant gets the same page, where the blocks are
+forecasts the next walk-in may move. Fixed appointments carry a marker and a
+different colour, because "promised" and "predicted" cannot be allowed to look
+alike on a wall the shop runs its day from.
 
 ### Migration
 
