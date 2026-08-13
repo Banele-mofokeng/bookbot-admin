@@ -211,6 +211,16 @@ Nothing is persisted as a timer, so a restart or crash can't lose a warning —
 worst case it goes out one tick late. `"You're up next"` still fires
 immediately when staff mark someone Done/NoShow/Cancelled.
 
+**The midnight sweep covers a range, not one date.** `midnight_reset_job` runs
+at 00:01 and again on startup, closing everything left open on any day *before
+today* — today itself is still being worked, and future bookings are never
+touched. The 00:01 cron does not fire retroactively, so a process down across
+two midnights would otherwise strand the older day forever: its entries stay
+`Waiting`, keep occupying their agent in every backlog and ETA calculation, and
+never reach reporting as closed. It works in batches of `SWEEP_BATCH` (500) per
+transaction, so the first pass after a long outage doesn't hold one long write
+lock.
+
 ### Monitoring
 `GET /health` reports `outbox_pending` and `outbox_failed`. Pending should sit
 near zero; a climbing number means Evolution is unreachable, and any `failed`
@@ -474,10 +484,13 @@ delivery. `Collected` is what books an order as money taken — the board's
 
 ### The midnight sweep
 
-`midnight_reset_job` cancels yesterday's `Placed`, `Preparing` and `Ready`
-orders with `closed_by = "system"` — the same provenance rule the queue uses
-(see [The no-show trap](#the-no-show-trap)). It never marks them `Collected`,
-which would book money as taken for food that may still be sitting on the pass.
+`midnight_reset_job` cancels `Placed`, `Preparing` and `Ready` orders from any
+day before today with `closed_by = "system"` — the same provenance rule the
+queue uses (see [The no-show trap](#the-no-show-trap)). It never marks them
+`Collected`, which would book money as taken for food that may still be sitting
+on the pass. Orders with a blank `order_date` are left alone: a blank sorts
+before every real date, and a row whose day is unknown is not a row the sweep
+knows to be stale.
 
 ### API
 
