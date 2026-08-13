@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import Sidebar from './components/Sidebar.jsx'
 import Queue from './pages/queue/Queue.jsx'
+import Calendar from './pages/calendar/Calendar.jsx'
 import Services from './pages/services/Services.jsx'
 import Agents from './pages/agents/Agents.jsx'
 import Reports from './pages/reports/Reports.jsx'
@@ -13,6 +14,7 @@ import { api, login as apiLogin, getMe, getToken, clearToken, setUnauthorizedHan
 
 const PAGE_TITLES = {
   '/':                     'Queue',
+  '/calendar':             'Calendar',
   '/services':             'Services',
   '/agents':               'Agents',
   '/reports':              'Reports',
@@ -158,6 +160,7 @@ export default function App() {
           <Routes>
             {/* A takeaway-only account has no queue to land on. */}
             <Route path="/"                    element={ordersOnly ? <Navigate to="/orders" replace /> : <Queue tenants={tenants} />} />
+            <Route path="/calendar"            element={<Calendar   tenants={tenants} />} />
             <Route path="/services"            element={<Services   tenants={tenants} />} />
             <Route path="/agents"              element={<Agents     tenants={tenants} />} />
             <Route path="/reports"             element={<Reports    tenants={tenants} />} />

@@ -17,10 +17,11 @@ router = APIRouter(dependencies=[Depends(get_current_user)])
 from app.core import format_eta, normalize_number
 from app.jobs import _fire_youre_next
 from app.messaging import queue_is_open_today, send_text
-from app.queue_engine import (_service_map, assign_agent,
+from app.queue_engine import (_entry_end, _service_map, assign_agent,
                               calculate_estimated_start, cancel_party,
                               find_walkin_insert_joined_at,
-                              get_agent_backlog_minutes, recalculate_queue)
+                              get_agent_backlog_minutes,
+                              get_working_windows_for, recalculate_queue)
 from app.sessions import booking_lock
 
 @router.get("/admin/queue/{tenant_id}")
@@ -71,6 +72,144 @@ def get_queue(tenant_id: int, queue_date: Optional[str] = None,
                 "joined_at":        e.joined_at.isoformat(),
             })
         return result
+
+
+# Terminal statuses are left off the timeline on purpose. A cancelled booking
+# gives its time back — drawing it would show the day as fuller than it is,
+# which is the one thing a calendar must never do.
+TIMELINE_STATUSES = ["Waiting", "InService", "Done"]
+
+
+def _timeline_row(entry: QueueEntry, services: Dict[int, Service]) -> Dict[str, Any]:
+    end = _entry_end(entry, services)
+    service = services.get(entry.service_id)
+    return {
+        "id":              entry.id,
+        "customer_name":   entry.customer_name,
+        "customer_number": entry.customer_number.replace("@s.whatsapp.net", ""),
+        "service":         service.name if service else "—",
+        "status":          entry.status,
+        "booked_via":      entry.booked_via,
+        # The distinction the whole view exists to show: a promised time versus
+        # a forecast that the next walk-in may move.
+        "is_fixed":        entry.is_fixed,
+        "start":           entry.estimated_start.isoformat() if entry.estimated_start else None,
+        "end":             end.isoformat() if end else None,
+        "minutes":         int((end - entry.estimated_start).total_seconds() // 60)
+                           if end and entry.estimated_start else 0,
+    }
+
+
+@router.get("/admin/timeline/{tenant_id}")
+def get_day_timeline(tenant_id: int, queue_date: Optional[str] = None,
+                     user: User = Depends(get_current_user)):
+    """
+    One day laid out per agent: the hours each one works, and the work already
+    placed inside them.
+
+    The queue list answers "who is next?". This answers "where are the gaps?" —
+    the question a shop taking booked appointments actually asks, and one a
+    table cannot answer, because a free hour is the absence of a row and
+    absence is exactly what a list cannot draw.
+
+    Batched like get_queue: windows for every agent in three queries, one
+    service lookup, no per-agent round trip.
+    """
+    ensure_tenant_access(user, tenant_id)
+    target = queue_date or core.today_str()
+    day    = datetime.strptime(target, "%Y-%m-%d")
+
+    with Session(engine) as s:
+        tenant = s.get(Tenant, tenant_id)
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+        agents  = s.exec(select(Agent).where(Agent.tenant_id == tenant_id)).all()
+        entries = s.exec(
+            select(QueueEntry).where(
+                QueueEntry.tenant_id  == tenant_id,
+                QueueEntry.queue_date == target,
+                QueueEntry.status.in_(TIMELINE_STATUSES),
+            )
+        ).all()
+        services = _service_map(s, entries)
+
+    by_agent: Dict[Any, List[QueueEntry]] = {}
+    for e in entries:
+        by_agent.setdefault(e.agent_id, []).append(e)
+
+    # An agent switched off at lunchtime still has this morning's customers on
+    # the board. Dropping them from the view because the agent is now inactive
+    # would hide work that is still happening.
+    visible  = [a for a in agents if a.is_active or a.id in by_agent]
+    windows  = get_working_windows_for([a.id for a in visible], tenant, target)
+
+    # One shared axis across every column, or two agents' 10:00 would not line
+    # up. Widened to cover anything scheduled outside the working hours — an
+    # overrun is precisely what someone opens this view to find.
+    edges: List[datetime] = []
+    for spans in windows.values():
+        for w_start, w_end in spans:
+            edges += [w_start, w_end]
+    for e in entries:
+        end = _entry_end(e, services)
+        if e.estimated_start and end:
+            edges += [e.estimated_start, end]
+
+    if edges:
+        day_start = min(edges).replace(minute=0, second=0, microsecond=0)
+        latest    = max(edges)
+        day_end   = latest.replace(minute=0, second=0, microsecond=0)
+        if day_end < latest:
+            day_end += timedelta(hours=1)
+    else:
+        day_start = day + timedelta(hours=tenant.queue_opens)
+        day_end   = day + timedelta(hours=tenant.queue_closes)
+    # A closed day, or a tenant configured opens == closes, would otherwise
+    # hand the grid a zero-height axis to divide by.
+    if day_end <= day_start:
+        day_end = day_start + timedelta(hours=1)
+
+    columns = []
+    for agent in visible:
+        spans   = windows.get(agent.id, [])
+        mine    = sorted(by_agent.get(agent.id, []),
+                         key=lambda e: (e.estimated_start or datetime.max))
+        placed  = [e for e in mine if e.estimated_start and _entry_end(e, services)]
+        drawn   = {e.id for e in placed}
+        working = sum(int((w_end - w_start).total_seconds() // 60) for w_start, w_end in spans)
+        booked  = sum(int((_entry_end(e, services) - e.estimated_start).total_seconds() // 60)
+                      for e in placed)
+        columns.append({
+            "agent_id":   agent.id,
+            "name":       agent.name,
+            "is_active":  agent.is_active,
+            "working":    bool(spans),
+            "windows": [
+                {"start": w_start.isoformat(), "end": w_end.isoformat(),
+                 "minutes": int((w_end - w_start).total_seconds() // 60)}
+                for w_start, w_end in spans
+            ],
+            "entries":    [_timeline_row(e, services) for e in placed],
+            # Nothing should land here, but an entry with no start would
+            # otherwise vanish from a view staff are trusting to be complete.
+            "unplaced":   [_timeline_row(e, services) for e in mine if e.id not in drawn],
+            "booked_minutes":  booked,
+            "working_minutes": working,
+            "free_minutes":    max(0, working - booked),
+        })
+
+    known = {a.id for a in visible}
+    return {
+        "tenant_id":  tenant_id,
+        "queue_date": target,
+        "day_start":  day_start.isoformat(),
+        "day_end":    day_end.isoformat(),
+        "agents":     columns,
+        # Entries pointing at an agent row that no longer exists. Belongs in
+        # the response rather than swallowed, for the same reason as unplaced.
+        "orphaned":   [_timeline_row(e, services)
+                       for e in entries if e.agent_id not in known],
+    }
 
 
 @router.patch("/admin/queue/{entry_id}/status")
