@@ -1,12 +1,14 @@
 """Scheduled work: proactive customer notifications and the midnight sweep."""
 from datetime import datetime, timedelta
 from typing import Optional
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app import config, core
 from app.core import format_eta, normalize_number
 from app.db import engine
-from app.models import Tenant, Service, Agent, Order, QueueEntry
+from app.models import (Tenant, Service, Agent, NotificationLog, Order,
+                        QueueEntry)
 from app.messaging import send_text
 
 # =============================================================================
@@ -20,28 +22,60 @@ def get_notify_number(entry) -> str:
     return entry.customer_number
 
 
-def _claim_notification(entry_id: int, flag: str) -> bool:
+# Notification rules. A rule names one notification for one entry. It is stored
+# as data, never interpolated into SQL, so new ones cost nothing but a name —
+# which is what a reminder ladder (T-24h, T-2h, T-30m) will need.
+RULE_TWO_AWAY   = "two_away"
+RULE_YOURE_NEXT = "youre_next"
+
+# The boolean columns these two rules used to live in. Written alongside the log
+# so a rollout where old and new processes overlap cannot re-send: the old code
+# reads the column and knows nothing about the log. Delete this map, and the
+# columns, once no process reading them is still running.
+_LEGACY_COLUMNS = {
+    RULE_TWO_AWAY:   "notified_two_away",
+    RULE_YOURE_NEXT: "notified_next",
+}
+
+
+def _already_notified(s: Session, entry_id: int, rule: str) -> bool:
+    """Whether this notification has already been claimed for this entry."""
+    return s.exec(
+        select(NotificationLog).where(
+            NotificationLog.entry_id == entry_id,
+            NotificationLog.rule     == rule,
+        )
+    ).first() is not None
+
+
+def _claim_notification(entry_id: int, rule: str) -> bool:
     """
     Atomically claim the right to send one notification for one entry.
 
-    Flips notified_two_away / notified_next from False to True in a single
-    conditional UPDATE and reports whether this caller was the one that flipped
-    it. A read-then-write would let the reconciler and a live status change both
-    decide to send the same message. Returns False if already claimed.
+    Inserts the (entry, rule) pair and reports whether this caller is the one
+    that got it in. The unique constraint arbitrates, so the reconciler and a
+    live status change racing on the same entry cannot both decide to send —
+    a read-then-write would let them. Returns False if already claimed.
     """
-    from sqlalchemy import text as sql_text
-    if flag not in ("notified_two_away", "notified_next"):
-        raise ValueError(f"unknown notification flag {flag!r}")
     with Session(engine) as s:
-        result = s.execute(
-            sql_text(
-                f"UPDATE queueentry SET {flag} = :yes "
-                f"WHERE id = :eid AND {flag} = :no"
-            ),
-            {"eid": entry_id, "yes": True, "no": False},
-        )
-        s.commit()
-        return result.rowcount == 1
+        s.add(NotificationLog(entry_id=entry_id, rule=rule, sent_at=core.now()))
+        try:
+            s.commit()
+        except IntegrityError:
+            s.rollback()
+            return False
+
+    # Mirror into the legacy column, for as long as one exists for this rule.
+    # Deliberately after the claim: the log is the decision, this is a copy.
+    column = _LEGACY_COLUMNS.get(rule)
+    if column:
+        with Session(engine) as s:
+            entry = s.get(QueueEntry, entry_id)
+            if entry:
+                setattr(entry, column, True)
+                s.add(entry)
+                s.commit()
+    return True
 
 
 def _next_waiting(s: Session, tenant_id: int, agent_id: int, queue_date: str):
@@ -63,7 +97,7 @@ def _fire_15min_warning(tenant_id: int, agent_id: int, queue_date: str):
         if not tenant:
             return
         next_entry = _next_waiting(s, tenant_id, agent_id, queue_date)
-        if not next_entry or next_entry.notified_two_away:
+        if not next_entry or _already_notified(s, next_entry.id, RULE_TWO_AWAY):
             return
         notify_to = get_notify_number(next_entry)
         if not notify_to:
@@ -78,9 +112,9 @@ def _fire_15min_warning(tenant_id: int, agent_id: int, queue_date: str):
             f"Start making your way over \U0001f6b6"
         )
     # Claim before queueing, so a concurrent caller cannot queue it too.
-    if not _claim_notification(entry_id, "notified_two_away"):
+    if not _claim_notification(entry_id, RULE_TWO_AWAY):
         return
-    send_text(tenant, notify_to, body, dedupe_key=f"two_away:{entry_id}")
+    send_text(tenant, notify_to, body, dedupe_key=f"{RULE_TWO_AWAY}:{entry_id}")
 
 
 def reconcile_notifications() -> int:
@@ -123,15 +157,15 @@ def _fire_youre_next(tenant_id: int, agent_id: int, queue_date: str):
     Called when an entry is marked Done / NoShow / Cancelled — tells the next
     waiter they're up, immediately. There is no scheduled 15-minute job to
     cancel any more: reconcile_notifications derives that warning from live
-    state, and once this entry is claimed the warning is suppressed by the same
-    notified_two_away flag.
+    state, and once this entry is claimed the warning is suppressed by claiming
+    RULE_TWO_AWAY alongside it.
     """
     with Session(engine) as s:
         tenant = s.get(Tenant, tenant_id)
         if not tenant:
             return
         next_entry = _next_waiting(s, tenant_id, agent_id, queue_date)
-        if not next_entry or next_entry.notified_next:
+        if not next_entry or _already_notified(s, next_entry.id, RULE_YOURE_NEXT):
             return
         notify_to = get_notify_number(next_entry)
         if not notify_to:
@@ -144,11 +178,11 @@ def _fire_youre_next(tenant_id: int, agent_id: int, queue_date: str):
             f"Head over now — {agent.name if agent else tenant.agent_label} is ready for you.\n"
             f"\U0001f4bc {service.name if service else ''}"
         )
-    if not _claim_notification(entry_id, "notified_next"):
+    if not _claim_notification(entry_id, RULE_YOURE_NEXT):
         return
     # Being told "you're up next" makes the 15-minute warning redundant.
-    _claim_notification(entry_id, "notified_two_away")
-    send_text(tenant, notify_to, body, dedupe_key=f"youre_next:{entry_id}")
+    _claim_notification(entry_id, RULE_TWO_AWAY)
+    send_text(tenant, notify_to, body, dedupe_key=f"{RULE_YOURE_NEXT}:{entry_id}")
 
 def _sweep_stale_orders(today: str) -> int:
     """

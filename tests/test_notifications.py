@@ -14,7 +14,8 @@ from sqlmodel import Session, select
 
 import main
 from app import config, core, db, jobs, messaging
-from app.models import Tenant, Service, Agent, AgentService, QueueEntry, OutboxMessage
+from app.models import (Tenant, Service, Agent, AgentService, NotificationLog,
+                        QueueEntry, OutboxMessage)
 
 QUEUE_DATE = "2026-06-20"
 
@@ -254,12 +255,122 @@ def test_claim_notification_succeeds_once_then_fails():
     assert jobs._claim_notification(eid, "notified_next") is False
 
 
-def test_claim_notification_rejects_unknown_flag():
-    """The flag name is interpolated into SQL — only the two known ones pass."""
+def test_claim_notification_stores_the_rule_rather_than_running_it():
+    """
+    The rule used to be interpolated into an UPDATE, so it had to be checked
+    against an allow-list of two column names. It is a bound parameter now: a
+    rule that looks like SQL is just an odd string, and the entry is untouched.
+    """
     tid, svc, aid = _seed()
     eid = _entry(tid, svc, aid, "Thabo")
-    with pytest.raises(ValueError):
-        jobs._claim_notification(eid, "status = 'Done' --")
+    hostile = "status = 'Done' --"
+
+    assert jobs._claim_notification(eid, hostile) is True
+    assert jobs._claim_notification(eid, hostile) is False
+
+    with Session(db.engine) as s:
+        assert s.get(QueueEntry, eid).status == "Waiting"
+        logged = s.exec(
+            select(NotificationLog).where(NotificationLog.entry_id == eid)
+        ).all()
+    assert [r.rule for r in logged] == [hostile]
+
+
+def test_rules_are_independent():
+    """
+    What the log buys: a reminder ladder is three names, not three migrations
+    on the hottest table in the app.
+    """
+    tid, svc, aid = _seed()
+    eid = _entry(tid, svc, aid, "Thabo")
+
+    for rule in ("t_minus_24h", "t_minus_2h", "t_minus_30m"):
+        assert jobs._claim_notification(eid, rule) is True, f"{rule} was blocked"
+    assert jobs._claim_notification(eid, "t_minus_2h") is False
+
+
+def test_the_same_rule_on_two_entries_does_not_collide():
+    tid, svc, aid = _seed()
+    one = _entry(tid, svc, aid, "Thabo")
+    two = _entry(tid, svc, aid, "Naledi")
+    assert jobs._claim_notification(one, jobs.RULE_TWO_AWAY) is True
+    assert jobs._claim_notification(two, jobs.RULE_TWO_AWAY) is True
+
+
+def test_the_legacy_columns_are_still_written():
+    """
+    A rollout where an old process is still running must not re-send: that
+    process reads the boolean column and knows nothing about the log.
+    """
+    tid, svc, aid = _seed()
+    eid = _entry(tid, svc, aid, "Thabo")
+
+    jobs._claim_notification(eid, jobs.RULE_TWO_AWAY)
+    jobs._claim_notification(eid, jobs.RULE_YOURE_NEXT)
+
+    with Session(db.engine) as s:
+        e = s.get(QueueEntry, eid)
+    assert e.notified_two_away is True
+    assert e.notified_next is True
+
+
+# ── backfill ─────────────────────────────────────────────────────────────────
+def test_backfill_seeds_the_log_from_the_old_columns():
+    tid, svc, aid = _seed()
+    eid = _entry(tid, svc, aid, "Warned before the refactor")
+    with Session(db.engine) as s:
+        e = s.get(QueueEntry, eid)
+        e.notified_two_away = True
+        s.add(e); s.commit()
+
+    db.backfill_notification_log()
+
+    with Session(db.engine) as s:
+        assert jobs._already_notified(s, eid, jobs.RULE_TWO_AWAY) is True
+        assert jobs._already_notified(s, eid, jobs.RULE_YOURE_NEXT) is False
+
+
+def test_backfill_is_idempotent():
+    """It runs on every startup, not once."""
+    tid, svc, aid = _seed()
+    eid = _entry(tid, svc, aid, "Thabo")
+    with Session(db.engine) as s:
+        e = s.get(QueueEntry, eid)
+        e.notified_next = True
+        s.add(e); s.commit()
+
+    db.backfill_notification_log()
+    db.backfill_notification_log()
+
+    with Session(db.engine) as s:
+        rows = s.exec(
+            select(NotificationLog).where(NotificationLog.entry_id == eid)
+        ).all()
+    assert len(rows) == 1
+
+
+def test_an_entry_warned_before_the_refactor_is_not_warned_again(monkeypatch):
+    """
+    The whole point of the backfill. Without it, the first tick after deploy
+    re-warns every entry that was already warned — across every live queue at
+    once, telling customers they are nearly up when they are not.
+    """
+    tid, svc, aid = _seed(duration_minutes=60)
+    start = datetime(2026, 6, 20, 9, 0)
+    _entry(tid, svc, aid, "Being served", status="InService", estimated_start=start)
+    waiter = _entry(tid, svc, aid, "Already warned",
+                    estimated_start=start + timedelta(hours=1))
+    # Exactly the state an old process leaves behind: column set, no log row.
+    with Session(db.engine) as s:
+        e = s.get(QueueEntry, waiter)
+        e.notified_two_away = True
+        s.add(e); s.commit()
+
+    db.backfill_notification_log()
+
+    _freeze(monkeypatch, start + timedelta(minutes=50))
+    jobs.reconcile_notifications()
+    assert _outbox() == [], "the backfill is what stops the second warning"
 
 
 # ── reconciler ───────────────────────────────────────────────────────────────

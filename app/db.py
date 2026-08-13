@@ -1,10 +1,10 @@
 """Engine, indexes, and the additive migrations create_all cannot do."""
 from sqlmodel import SQLModel, create_engine
 
-from app import config
+from app import config, core
 from app.models import (Tenant, User, Service, Agent, AgentService,
                         AgentSchedule, AgentBlock, QueueEntry, OutboxMessage,
-                        MenuItem, Order, OrderItem)
+                        NotificationLog, MenuItem, Order, OrderItem)
 
 engine = create_engine(config.DATABASE_URL)
 
@@ -102,6 +102,49 @@ ADDED_COLUMNS = {
 }
 
 
+# The boolean columns notification_log replaced, and the rule each one became.
+# Kept here rather than imported from jobs so this module stays free of any
+# dependency on the job layer.
+_NOTIFICATION_BACKFILL = [
+    ("notified_two_away", "two_away"),
+    ("notified_next",     "youre_next"),
+]
+
+
+def backfill_notification_log():
+    """
+    Seed notification_log from the boolean columns it replaced.
+
+    Without this, every entry already warned before this shipped looks unclaimed
+    to the new code, and gets warned a second time on the first tick after
+    deploy — across every live queue at once. Customers would be told they are
+    next when they are not.
+
+    Runs on every startup and is a no-op once seeded: the NOT EXISTS clause and
+    the unique constraint behind it both make a second insert impossible.
+    """
+    from sqlalchemy import text as sql_text
+    with engine.connect() as conn:
+        for column, rule in _NOTIFICATION_BACKFILL:
+            # A bare column reference rather than "= TRUE": SQLite stores these
+            # as 0/1 and PostgreSQL as a real boolean, and both accept the
+            # column on its own in a WHERE. The column name is one of ours, not
+            # input. The rule is bound.
+            # "rule" is quoted: it is non-reserved in PostgreSQL today, but it
+            # was a keyword once and quoting costs nothing to be sure of.
+            conn.execute(sql_text(
+                f'INSERT INTO {NotificationLog.__tablename__} '
+                f'    (entry_id, "rule", sent_at) '
+                f'SELECT q.id, :rule, :seeded_at '
+                f'  FROM {QueueEntry.__tablename__} q '
+                f' WHERE q.{column} '
+                f'   AND NOT EXISTS ('
+                f'       SELECT 1 FROM {NotificationLog.__tablename__} n '
+                f'        WHERE n.entry_id = q.id AND n."rule" = :rule)'
+            ), {"rule": rule, "seeded_at": core.now()})
+        conn.commit()
+
+
 def create_db_and_tables():
     from sqlalchemy import text as sql_text
     SQLModel.metadata.create_all(engine)
@@ -119,4 +162,6 @@ def create_db_and_tables():
                         f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"
                     ))
                     conn.commit()
+    # Last, so it runs against a schema that is already up to date.
+    backfill_notification_log()
 

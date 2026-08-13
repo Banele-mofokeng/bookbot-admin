@@ -1,6 +1,7 @@
 """SQLModel tables. No behaviour lives here."""
 from datetime import datetime
 from typing import Optional
+from sqlalchemy import UniqueConstraint
 from sqlmodel import SQLModel, Field
 
 from app.core import now
@@ -134,6 +135,10 @@ class QueueEntry(SQLModel, table=True):
     estimated_start: Optional[datetime] = None       # calculated ETA
     earliest_arrival: Optional[datetime] = None      # customer's declared arrival time
     position: int              = 0                   # display position in full queue
+    # Superseded by NotificationLog, which is now what decides whether a
+    # notification has been claimed. Still written, so a rollout where old and
+    # new processes overlap cannot re-send — the old code reads these and knows
+    # nothing about the log. Drop both once no such process is left running.
     notified_two_away: bool    = False
     notified_next: bool        = False
     joined_at: datetime        = Field(default_factory=now)
@@ -172,6 +177,34 @@ class OutboxMessage(SQLModel, table=True):
     last_error: str            = ""
     created_at: datetime       = Field(default_factory=now)
     sent_at: Optional[datetime] = None
+
+
+class NotificationLog(SQLModel, table=True):
+    """
+    One row per notification claimed for one queue entry.
+
+    Replaces a boolean column per notification kind. A column per kind stops
+    scaling the moment there are more than a couple — a reminder ladder wants
+    T-24h, T-2h and T-30m — and each new one costs a migration on the hottest
+    table in the app. A row per (entry, rule) costs none.
+
+    The unique constraint *is* the claim. Two callers racing to send the same
+    notification both INSERT, exactly one commits, and the loser is told it
+    lost. Stricter than a read-then-write, and unlike the conditional UPDATE
+    this replaced, the rule arrives as a bound parameter rather than as SQL
+    text — so a rule name can be anything stable without being a hazard.
+    """
+    __tablename__ = "notification_log"
+    __table_args__ = (
+        UniqueConstraint("entry_id", "rule", name="uq_notification_entry_rule"),
+    )
+    id: Optional[int]          = Field(default=None, primary_key=True)
+    entry_id: int              = Field(foreign_key="queueentry.id", index=True)
+    rule: str                                        # "two_away", "youre_next", …
+    # When the claim was made, not when the message reached the customer — the
+    # outbox owns delivery. Rows seeded by the backfill carry the time they were
+    # seeded, because the original send time was never recorded anywhere.
+    sent_at: datetime          = Field(default_factory=now)
 
 
 # =============================================================================

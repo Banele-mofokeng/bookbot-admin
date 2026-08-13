@@ -202,7 +202,17 @@ than silently lost.
   must arrive in the order they were written. A failing message is deferred and
   the worker moves on, so one unreachable tenant can't block the rest.
 - Notifications that must not duplicate (`you're next`, the 15-minute warning)
-  carry a `dedupe_key` and are claimed with a conditional UPDATE first.
+  carry a `dedupe_key` and are claimed in `notification_log` first.
+
+**One notification is one row, not one column.** `notification_log` holds a row
+per `(entry_id, rule)`, and its unique constraint *is* the claim: two callers
+racing on the same notification both INSERT, exactly one commits, and the loser
+is told it lost. Adding a notification means adding a rule name — no migration
+on `queueentry`, which is the hottest table in the app. `notified_two_away` and
+`notified_next` are still written so a rollout with an old process still running
+cannot re-send, and `backfill_notification_log()` seeds the log from them on
+startup; without that seed the first tick after deploy would re-warn every entry
+already warned. Both columns can go once no old process is left.
 
 **The 15-minute warning is derived from queue state, not scheduled.** Every
 `RECONCILE_SECONDS` (60) the reconciler looks at who is currently `InService`
