@@ -14,6 +14,24 @@ if DATABASE_URL.startswith("postgres://"):
 if not DATABASE_URL:
     DATABASE_URL = "postgresql://postgres:password@localhost:5432/queuebot"
 
+# Pin the driver to psycopg2 explicitly.
+#
+# SQLAlchemy 2.1 changed the default dialect for a bare "postgresql://" URL
+# from psycopg2 to psycopg3, and psycopg3 is not a drop-in replacement: it
+# sends parameters to the server to be type-inferred rather than
+# interpolating them client-side. This app's SQL relies on the old
+# behaviour — the notification backfill binds one value to two columns
+# (VARCHAR and TEXT) in the same statement, which the server cannot infer
+# a single type for, and psycopg3 raises "inconsistent types deduced for
+# parameter $1" where psycopg2 quietly succeeds.
+#
+# Naming the driver keeps the connection on the driver this code was
+# written against, regardless of which SQLAlchemy version is installed.
+# An explicit "+psycopg" in the URL is left alone, so anyone who has
+# deliberately chosen the new driver keeps it.
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
 REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 SESSION_TTL  = 60 * 30  # 30 min inactivity expires session

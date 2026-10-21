@@ -1,0 +1,42 @@
+# Keep the build context small and free of anything the bot image does not
+# need. Without this, `docker build` uploads node_modules (227 MB), the
+# built frontend, and the whole .git history on every deploy.
+#
+# The context root is the repo root, because Dockerfile.bot lives there and
+# copies main.py and app/ from it.
+
+# Node — the frontend is built by Node, not by this image.
+node_modules/
+dist/
+package-lock.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Cloudflare / tooling
+.wrangler/
+.dev.vars*
+!.dev.vars.example
+
+# Secrets — never bake these into an image.
+.env
+.env.*
+
+# Version control
+.git/
+.gitignore
+
+# Tests and docs are not in the image.
+tests/
+DEPLOY.md
+*.md
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

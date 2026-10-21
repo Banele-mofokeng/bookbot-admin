@@ -17,6 +17,22 @@ router = APIRouter(dependencies=[Depends(get_current_user)])
 # Health is unauthenticated — a probe has no token.
 public_router = APIRouter()
 
+@public_router.get("/ping")
+def ping():
+    """
+    Liveness probe that touches nothing.
+
+    Deliberately separate from /health, which queries Postgres and Redis. A
+    container's readiness check asks "is the process up", and answering that
+    with a database round-trip means a slow or unreachable database looks
+    exactly like a dead process — the container would be reported unhealthy
+    and restarted when the real problem was somewhere else entirely.
+
+    Returns 200 as long as the app is serving requests.
+    """
+    return {"status": "ok"}
+
+
 @public_router.get("/health")
 def health():
     try:

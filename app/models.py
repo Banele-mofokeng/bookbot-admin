@@ -1,10 +1,96 @@
 """SQLModel tables. No behaviour lives here."""
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import DateTime, UniqueConstraint, TypeDecorator
 from sqlmodel import SQLModel, Field
 
 from app.core import now
+
+
+class NaiveLocalDateTime(TypeDecorator):
+    """
+    A datetime column holding naive local time, on every SQLModel version.
+
+    This app keeps its datetimes naive and local: a queue entry's
+    estimated_start is a wall-clock time at the shop, and app/core.now()
+    returns local time in the configured timezone. The models have always
+    stored it that way, and every comparison in the codebase assumes it —
+    subtracting two datetimes, or checking one against now(), is only
+    meaningful if both are naive.
+
+    SQLModel changed what a bare `datetime` annotation maps to. On 0.0.38 it
+    became a plain naive DateTime; from 0.0.44 onwards it became
+    UTCDateTime, a type that insists on timezone-aware values and refuses to
+    bind a naive one. That turns every write of core.now() into a
+    ValueError, and the outbox drain starts failing on every single pass.
+
+    Declaring the type here rather than relying on the library's default
+    makes the column identical on every version, so a deploy cannot change
+    the schema underneath a live database.
+
+    The result side is deliberately forgiving. A database created by an
+    earlier version may hold timezone-aware columns, and psycopg2 hands
+    those back as aware datetimes. Comparing an aware value against a naive
+    one raises TypeError, so a value is converted to naive UTC on the way
+    out. Every timestamp this app writes is local time, so a column holding
+    an instant is read back as that same instant without an offset — the
+    only reading that cannot silently shift a customer's appointment.
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        # Naive on the way in means a plain TIMESTAMP column, which is what
+        # every version of this app has created.
+        return dialect.type_descriptor(DateTime(timezone=False))
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if not isinstance(value, datetime):
+            # Not a datetime at all — a string literal compared against the
+            # column, for instance. A plain DateTime passed those through
+            # untouched, and the database casts them; doing the same keeps
+            # that working.
+            return value
+        if value.tzinfo is None:
+            return value
+        # An aware value has no meaning here beyond the instant it names, so
+        # store that instant as UTC and let the reader interpret it the same
+        # way. Naive values pass through untouched, which is the normal path.
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def literal_processor(self, dialect):
+        """
+        Render a value as a literal in a compiled statement.
+
+        A TypeDecorator does not inherit the underlying type's literal
+        processor, and a query that compares a datetime column to a plain
+        string — used to assert which index the planner picks — would
+        otherwise fail to compile.
+        """
+        base = DateTime(timezone=False).literal_processor(dialect)
+
+        def process(value):
+            if isinstance(value, datetime):
+                value = self.process_bind_param(value, dialect)
+            return base(value)
+
+        return process
+
+
+def naive_dt(**kwargs) -> Field:
+    """A datetime column that stores naive local time."""
+    return Field(sa_type=NaiveLocalDateTime, **kwargs)
+
 
 # =============================================================================
 # 2. DATABASE MODELS
@@ -122,8 +208,8 @@ class AgentBlock(SQLModel, table=True):
     id: Optional[int]          = Field(default=None, primary_key=True)
     tenant_id: int             = Field(foreign_key="tenant.id")
     agent_id: int              = Field(foreign_key="agent.id")
-    starts_at: datetime
-    ends_at: datetime
+    starts_at: datetime = naive_dt()
+    ends_at: datetime = naive_dt()
     reason: str                = ""
 
 
@@ -142,8 +228,8 @@ class QueueEntry(SQLModel, table=True):
     status: str                = "Waiting"           # Waiting|InService|Done|NoShow|Cancelled
     booked_via: str            = "whatsapp"          # whatsapp | walkin
     queue_date: str                                  # "2026-03-18" — ISO date string
-    estimated_start: Optional[datetime] = None       # calculated ETA
-    earliest_arrival: Optional[datetime] = None      # customer's declared arrival time
+    estimated_start: Optional[datetime] = naive_dt(default=None)       # calculated ETA
+    earliest_arrival: Optional[datetime] = naive_dt(default=None)      # customer's declared arrival time
     # ── Appointments ──
     # A queue entry's estimated_start is *derived*: recalculate_queue rewrites
     # it whenever anything ahead of it changes, which is right for a queue and
@@ -155,7 +241,7 @@ class QueueEntry(SQLModel, table=True):
     # When the promise ends. Written once at booking rather than derived from
     # Service.duration_minutes, so retiming a service tomorrow cannot silently
     # move the end of an appointment booked today.
-    slot_end: Optional[datetime] = None
+    slot_end: Optional[datetime] = naive_dt(default=None)
     position: int              = 0                   # display position in full queue
     # Superseded by NotificationLog, which is now what decides whether a
     # notification has been claimed. Still written, so a rollout where old and
@@ -163,7 +249,7 @@ class QueueEntry(SQLModel, table=True):
     # nothing about the log. Drop both once no such process is left running.
     notified_two_away: bool    = False
     notified_next: bool        = False
-    joined_at: datetime        = Field(default_factory=now)
+    joined_at: datetime        = naive_dt(default_factory=now)
     # ── Provenance, for reporting ──
     # Who closed this entry: "staff" (someone tapped it on the dashboard),
     # "customer" (cancelled over WhatsApp), "system" (the midnight sweep closed
@@ -173,8 +259,8 @@ class QueueEntry(SQLModel, table=True):
     # counting it as a no-show measures staff habits while claiming to measure
     # customers.
     closed_by: str             = ""
-    started_at: Optional[datetime]  = None   # first moved to InService
-    finished_at: Optional[datetime] = None   # reached a terminal status
+    started_at: Optional[datetime] = naive_dt(default=None)   # first moved to InService
+    finished_at: Optional[datetime] = naive_dt(default=None)   # reached a terminal status
 
 
 class OutboxMessage(SQLModel, table=True):
@@ -195,10 +281,10 @@ class OutboxMessage(SQLModel, table=True):
     status: str                = "Pending"   # Pending | Sent | Failed
     attempts: int              = 0
     # Indexed jointly with status — see INDEXES; alone it serves no query.
-    next_attempt_at: datetime  = Field(default_factory=now)
+    next_attempt_at: datetime  = naive_dt(default_factory=now)
     last_error: str            = ""
-    created_at: datetime       = Field(default_factory=now)
-    sent_at: Optional[datetime] = None
+    created_at: datetime       = naive_dt(default_factory=now)
+    sent_at: Optional[datetime] = naive_dt(default=None)
 
 
 class NotificationLog(SQLModel, table=True):
@@ -226,7 +312,7 @@ class NotificationLog(SQLModel, table=True):
     # When the claim was made, not when the message reached the customer — the
     # outbox owns delivery. Rows seeded by the backfill carry the time they were
     # seeded, because the original send time was never recorded anywhere.
-    sent_at: datetime          = Field(default_factory=now)
+    sent_at: datetime          = naive_dt(default_factory=now)
 
 
 # =============================================================================
@@ -267,12 +353,12 @@ class Order(SQLModel, table=True):
     total_cents: int           = 0
     order_date: str            = ""                  # "2026-08-02" — ISO date string
     placed_via: str            = "whatsapp"          # whatsapp | counter
-    ready_at: Optional[datetime] = None              # quoted collection time
+    ready_at: Optional[datetime] = naive_dt(default=None)              # quoted collection time
     notified_ready: bool       = False
     note: str                  = ""                  # "no chilli"
-    created_at: datetime       = Field(default_factory=now)
-    started_at: Optional[datetime]  = None           # first moved to Preparing
-    finished_at: Optional[datetime] = None           # reached a terminal status
+    created_at: datetime       = naive_dt(default_factory=now)
+    started_at: Optional[datetime] = naive_dt(default=None)           # first moved to Preparing
+    finished_at: Optional[datetime] = naive_dt(default=None)           # reached a terminal status
     # Same provenance rule as QueueEntry: "staff", "customer", "system", or ""
     # on rows written before this existed. Reporting must not merge them — an
     # order the midnight sweep cancelled means staff never closed it, not that

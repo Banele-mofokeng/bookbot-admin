@@ -1,0 +1,57 @@
+{
+  // Cloudflare Workers — the bot (FastAPI) in a Container.
+  //
+  // This is the second half of the deployment. The admin dashboard is a
+  // static SPA and is deployed by wrangler.jsonc; this config runs the API
+  // that SPA talks to.
+  //
+  // The bot is a real Linux container, not a Worker: it needs a long-lived
+  // process (APScheduler plus the WhatsApp outbox drain), a Postgres it
+  // talks to over TCP, and a Redis. None of that fits the Worker runtime,
+  // which freezes between requests and has no sockets of its own.
+  //
+  // The Worker in front is not optional: a container has no inbound port.
+  // Requests arrive at the Worker, which forwards them to the container.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bookbot-api",
+  "compatibility_date": "2026-10-21",
+  "main": "worker/api.js",
+  "observability": {
+    "enabled": true
+  },
+
+  // One container, one Durable Object class. max_instances is 1 because the
+  // bot's scheduler and outbox drain must not run twice — see DEPLOY.md,
+  // "Replicas: keep this at one".
+  "containers": [
+    {
+      "class_name": "BotContainer",
+      "image": "./Dockerfile.bot",
+      "instance_type": "basic",
+      "max_instances": 1
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "BOT",
+        "class_name": "BotContainer"
+      }
+    ]
+  },
+
+  "exports": {
+    "BotContainer": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+
+  // Keep the container awake. The bot's scheduled work only runs while the
+  // process is up; a sleeping container is a bot that has stopped sending
+  // reminders. Every 5 minutes is well inside the 10m sleep window.
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  }
+}

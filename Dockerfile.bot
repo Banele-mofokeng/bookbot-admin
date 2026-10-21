@@ -5,4 +5,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY app ./app
 EXPOSE 9000
+
+# The bot's scheduled work — reminders, the midnight reset, the WhatsApp
+# outbox drain — only runs while this process is up. A container that has
+# exited is a bot that has stopped sending messages, and Cloudflare restarts
+# a container whose process dies, so the process must not die on its own.
+#
+# uvicorn's default is a single worker, which is what this app wants: a
+# second worker would mean a second scheduler and a second outbox drain.
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9000"]
