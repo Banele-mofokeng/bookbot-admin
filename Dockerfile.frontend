@@ -14,14 +14,13 @@ RUN chmod +x ./node_modules/.bin/vite
 # named — a failure that shows up as an empty dashboard rather than as an error.
 # Failing during the build costs a deploy; the old container keeps serving until
 # a good one replaces it.
+#
+# The check itself lives in scripts/require-api-url.mjs, shared with the
+# Cloudflare build, so both paths refuse to build without it and say the same
+# thing when they do.
 ARG VITE_API_URL
-RUN test -n "$VITE_API_URL" || { \
-      echo "VITE_API_URL is not set. Set it as a variable on this service — it is" >&2; \
-      echo "baked into the bundle at build time. See DEPLOY.md, Service 2."       >&2; \
-      exit 1; \
-    }
 ENV VITE_API_URL=$VITE_API_URL
-RUN npx --no-install vite build
+RUN npm run build:deploy
 
 FROM nginx:alpine
 COPY --from=builder /app/dist /usr/share/nginx/html

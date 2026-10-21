@@ -20,9 +20,122 @@
 | `src/` | React admin frontend source |
 | `Dockerfile.frontend` | Docker image for the admin UI — bakes `VITE_API_URL` in at build time |
 | `nginx.conf` | SPA routing config for nginx |
+| `wrangler.jsonc` | Cloudflare Workers config — the dashboard as static assets |
+| `scripts/require-api-url.mjs` | Build guard: refuses to build without `VITE_API_URL` |
 
 Deployed on **Railway**: two services built from the Dockerfiles above, plus
 Railway's Postgres and Redis. Both redeploy automatically on a push to `main`.
+
+The admin frontend can also be deployed to **Cloudflare Workers** instead of
+Railway — see [Cloudflare Setup](#cloudflare-setup). The bot stays on Railway
+either way; it needs Postgres, Redis and a long-lived process, which Workers
+does not provide.
+
+---
+
+## Running locally
+
+Four moving parts, same as production: Postgres, Redis, the bot on `:9000`, the
+dashboard on `:5173`.
+
+**Postgres is required — SQLite is not a shortcut here.** `create_db_and_tables()`
+reads `information_schema.columns` to decide which `ADDED_COLUMNS` are missing,
+and SQLite has no such table, so the app dies on boot against it. The test suite
+runs on SQLite only because `conftest.py` calls `create_all()` directly and never
+takes that path. Run the real database locally and the schema you develop against
+is the schema you deploy to.
+
+### 1. Postgres and Redis
+
+```bash
+docker run -d --name qb-postgres -e POSTGRES_PASSWORD=password -e POSTGRES_DB=queuebot -p 5432:5432 postgres:16
+docker run -d --name qb-redis -p 6379:6379 redis:7
+```
+
+Those credentials are not arbitrary — they are exactly the fallbacks in
+`app/config.py`, so `DATABASE_URL` and `REDIS_URL` can stay unset locally. Set
+them explicitly if you run Postgres some other way.
+
+### 2. The bot
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .\.venv\Scripts\Activate.ps1
+pip install -r requirements-dev.txt
+```
+
+`psycopg2-binary` ships wheels for released Python versions only. On a very new
+interpreter pip falls back to building from source and needs the PostgreSQL
+client libraries; an older interpreter in the venv is the cheaper fix.
+
+Nothing in the app reads a `.env` file — `app/config.py` calls `os.getenv`
+directly, so these have to be in the shell that starts uvicorn:
+
+```bash
+export JWT_SECRET=dev-secret-not-for-prod
+export SUPERADMIN_EMAIL=you@example.com
+export SUPERADMIN_PASSWORD=devpassword123
+uvicorn main:app --reload --port 9000
+```
+
+Without `JWT_SECRET`, auth returns `503` and nothing in the dashboard works.
+Without the super-admin pair, no account is seeded and there is nobody to log in
+as. `WEBHOOK_SECRET` is worth skipping locally: leaving it unset is what lets you
+POST to `/webhook` by hand without a token, and startup prints the warning that
+would matter in production. Startup also creates the tables, adds the columns and
+builds the indexes, so the first run against an empty database is all the setup
+there is.
+
+Check `GET /health`, or read the routes at `/docs`.
+
+### 3. The dashboard
+
+In a second shell:
+
+```bash
+export VITE_API_URL=http://localhost:9000
+npm install
+npm run dev
+```
+
+**`VITE_API_URL` is not optional in dev either.** `src/api/client.js` falls back
+to a same-origin base when it is missing, and it requests `/auth/login` — not
+`/api/auth/login` — so the dev-server proxy in `vite.config.js`, which only
+rewrites the `/api` prefix, never sees the call. It hits Vite's own origin and
+404s. The bot's `ALLOWED_ORIGINS` defaults to `*`, so cross-origin calls to
+`:9000` work without extra config.
+
+Log in with the `SUPERADMIN_EMAIL` and `SUPERADMIN_PASSWORD` from step 2, then
+add a business from **Businesses → + Add Business** — the same path production
+takes, since there is no seed endpoint.
+
+### 4. Reading the database
+
+```bash
+docker exec -it qb-postgres psql -U postgres -d queuebot
+docker exec -it qb-redis redis-cli
+```
+
+Any GUI client (DBeaver, TablePlus, pgAdmin) takes the same URL the app uses:
+`postgresql://postgres:password@localhost:5432/queuebot`.
+
+### Reading the production database
+
+Railway dashboard → the Postgres service → **Variables** → `DATABASE_PUBLIC_URL`.
+The `DATABASE_URL` next to it resolves only inside Railway's private network and
+will not connect from a laptop.
+
+```bash
+psql "<DATABASE_PUBLIC_URL>"
+```
+
+That is live customer data: bookings, phone numbers, Evolution credentials on the
+tenant rows. Reads are fine; treat writes as production changes.
+
+> **Do not point a local bot at it.** Boot runs `create_db_and_tables()` and then
+> `midnight_reset_job()` immediately — a local process on the production URL will
+> alter the live schema and close out live queue entries, from a shell where you
+> were only meaning to look around.
 
 ---
 
@@ -161,6 +274,97 @@ Every step is additive and idempotent. Nothing is dropped, renamed or
 backfilled destructively, so a redeploy of an older image finds a database it
 still understands — the columns it does not know about are simply unread. That
 is what makes Railway's automatic deploys safe here.
+
+---
+
+## Cloudflare Setup
+
+The admin frontend is a static SPA. It can live on Cloudflare Workers instead
+of the Railway frontend service; the **bot stays on Railway**, because it needs
+Postgres, Redis and a long-lived process with a scheduler, none of which
+Workers provides.
+
+| Piece | Where |
+|-------|-------|
+| Admin dashboard | Cloudflare Workers (static assets) |
+| Bot (`main.py`) | Railway |
+| Postgres, Redis | Railway |
+
+### Why there is a `wrangler.jsonc`
+
+Wrangler's automatic configuration detects a Vite project and refuses to guess
+at anything older than Vite 6:
+
+```
+[ERROR] The version of Vite used in the project ("5.4.21") cannot be
+automatically configured. Please update the Vite version to at least "6.0.0"
+and try again.
+```
+
+Two things fix it, and this repo does both:
+
+1. **Vite is upgraded to 6.x** (`package.json`). The version in the error
+   message is the one that was pinned in `package.json`.
+2. **`wrangler.jsonc` is checked in.** Automatic configuration only runs when
+   there is no Wrangler config file, so a checked-in config makes the
+   deployment deterministic — Wrangler uploads the assets as they are, with no
+   framework detection in the way.
+
+The config uploads `dist/` as static assets with
+`not_found_handling: "single-page-application"`. That last line is what makes
+client-side routing work: without it, opening `/admin/businesses` directly
+returns Cloudflare's 404 page instead of `index.html`, and React Router never
+boots.
+
+### Deploy from the dashboard
+
+1. **Cloudflare Dashboard → Workers & Pages → Create → Import from GitHub**, and
+   pick this repository.
+2. **Settings → Builds → Build configuration:**
+   | Field | Value |
+   |-------|-------|
+   | Build command | `npm run build:deploy` |
+   | Deploy command | `npx wrangler deploy` |
+   | Root directory | *(leave empty)* |
+3. **Settings → Variables and Secrets → Add:**
+   | Name | Value | Environment |
+   |------|-------|-------------|
+   | `VITE_API_URL` | `https://<your-bot>.up.railway.app` | Build and runtime |
+
+   > **`VITE_API_URL` is baked into the bundle at build time.** Vite compiles
+   > it in, so changing the variable does nothing until the next build.
+   >
+   > `npm run build:deploy` **fails the build** if it is missing, rather than
+   > shipping a bundle that loads perfectly and talks to nothing. A failed
+   > build costs a deploy; the live site keeps serving until a good one
+   > replaces it.
+
+4. Deploy. Open the `*.workers.dev` URL — you should see the login screen.
+5. Add the `*.workers.dev` origin to the bot's `ALLOWED_ORIGINS` on Railway,
+   then redeploy the bot. The dashboard and the bot are on different origins,
+   so the browser will not make the requests at all until this is done.
+
+### Deploy from the command line
+
+```bash
+npm install
+npx wrangler login
+export VITE_API_URL=https://<your-bot>.up.railway.app
+npm run deploy
+```
+
+`npm run deploy` is `build:deploy` followed by `wrangler deploy` — the same
+two steps, with the same guard in between. `npm run preview:cf` serves the
+same build locally through `wrangler dev` if you want to check the routing
+before it goes out.
+
+### Cloudflare Pages
+
+If you would rather use Pages, the same build output works:
+`npx wrangler pages deploy dist`. `public/_redirects` is already in the repo
+and carries the SPA fallback (`/* /index.html 200`) for Pages, which does not
+read `not_found_handling`. The two are mutually exclusive configuration —
+Workers uses the `assets` block, Pages uses the `_redirects` file.
 
 ---
 

@@ -1,0 +1,23 @@
+{
+  // Cloudflare Workers — static assets only.
+  //
+  // The dashboard is a plain SPA: it talks to the bot over CORS, so there is
+  // no Worker code to run here. `assets.directory` is what `vite build`
+  // produces; `not_found_handling` is what makes client-side routing work —
+  // without it, a direct hit on /admin/businesses returns Cloudflare's 404
+  // page instead of index.html, and the React Router never boots.
+  //
+  // This file exists so Wrangler does not try to auto-configure the project.
+  // Auto-configuration detects Vite and refuses to guess at anything older
+  // than Vite 6; a checked-in config makes the deployment deterministic.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bookbot-admin",
+  "compatibility_date": "2026-10-21",
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application"
+  },
+  "observability": {
+    "enabled": true
+  }
+}
