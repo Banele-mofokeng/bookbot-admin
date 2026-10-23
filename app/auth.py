@@ -124,6 +124,14 @@ def seed_superadmin():
     with Session(engine) as s:
         existing = s.exec(select(User).where(User.email == email)).first()
         if existing:
+            # The account is already there, so the password in the environment
+            # is not applied. Say so, because the symptom is a login that
+            # answers "Invalid email or password" for a password the operator
+            # believes they just set — and the env var is the only place they
+            # would look for the reason.
+            print(f"ℹ️  Super-admin {email} already exists — password unchanged. "
+                  f"SUPERADMIN_PASSWORD only seeds a new account; to reset an "
+                  f"existing one use PATCH /admin/users/{existing.id}.")
             return
         s.add(User(email=email, password_hash=hash_password(config.SUPERADMIN_PASSWORD),
                    tenant_id=None, is_super=True, is_active=True))

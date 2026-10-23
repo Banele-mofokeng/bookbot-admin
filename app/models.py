@@ -1,7 +1,7 @@
 """SQLModel tables. No behaviour lives here."""
 from datetime import datetime, timezone
 from typing import Optional
-from sqlalchemy import DateTime, UniqueConstraint, TypeDecorator
+from sqlalchemy import DateTime, String, UniqueConstraint, TypeDecorator
 from sqlmodel import SQLModel, Field
 
 from app.core import now
@@ -78,11 +78,16 @@ class NaiveLocalDateTime(TypeDecorator):
         otherwise fail to compile.
         """
         base = DateTime(timezone=False).literal_processor(dialect)
+        # A string value has no .isoformat(), so the DateTime processor above
+        # cannot render it. Such a value is already in the form the database
+        # casts, and the string processor quotes it as it stands.
+        as_string = String().literal_processor(dialect)
 
         def process(value):
             if isinstance(value, datetime):
                 value = self.process_bind_param(value, dialect)
-            return base(value)
+                return base(value)
+            return as_string(value)
 
         return process
 
@@ -115,12 +120,13 @@ class Tenant(SQLModel, table=True):
     advance_days: int          = 1                   # how many days ahead allowed (0 = today only)
     is_active: bool            = True
     # ── Which conversation the bot runs ──
-    # "queue"  — book a slot with an agent (salon, clinic, workshop)
-    # "orders" — order items off a menu (takeaway, kasi fastfood)
+    # "queue"       — join a line and get an ETA (salon, workshop, walk-in)
+    # "appointments"— pick a fixed time and be held to it (clinic, barber)
+    # "orders"      — order items off a menu (takeaway, kasi fastfood)
     # One tenant runs one of them. Existing tenants default to queue, so this
     # column changes nothing for anyone already deployed.
     mode: str                  = "queue"
-    # ── Ordering config (ignored in queue mode) ──
+    # ── Ordering config (ignored outside orders mode) ──
     currency_symbol: str       = "R"
     # How many items the kitchen genuinely works on at once. Prep time for a
     # backlog is divided by this, so a two-pan kitchen quotes twice the wait of

@@ -109,6 +109,12 @@ Log in with the `SUPERADMIN_EMAIL` and `SUPERADMIN_PASSWORD` from step 2, then
 add a business from **Businesses → + Add Business** — the same path production
 takes, since there is no seed endpoint.
 
+**Those env vars only seed an account that does not exist yet.** If the email
+is already in the database, the password is left alone — changing
+`SUPERADMIN_PASSWORD` and restarting does not change the password of an
+account that already exists. To reset one, use `PATCH /admin/users/{id}`
+with a super-admin token, or delete the row and restart.
+
 ### 4. Reading the database
 
 ```bash
@@ -136,6 +142,127 @@ tenant rows. Reads are fine; treat writes as production changes.
 > `midnight_reset_job()` immediately — a local process on the production URL will
 > alter the live schema and close out live queue entries, from a shell where you
 > were only meaning to look around.
+
+### Windows
+
+The steps above are POSIX. On Windows (PowerShell or cmd) the same four parts,
+with the differences that actually bite:
+
+| | Windows |
+|---|---|
+| venv | `python -m venv .venv` then `.venv\Scripts\activate` (`.venv\Scripts\activate.ps1` in PowerShell) |
+| env vars | `set DATABASE_URL=...` per shell, or `$env:DATABASE_URL="..."` in PowerShell. One shell only — they are not inherited by a second one |
+| paths in `psql` | `docker exec -it qb-postgres psql -U postgres -d queuebot` works as-is |
+
+The one thing that is not optional on any platform: **the env vars must be in
+the shell that starts uvicorn.** Nothing in the app reads a `.env` file —
+`app/config.py` calls `os.getenv` directly — so exporting them in one terminal
+and starting the bot in another leaves it without a JWT secret, and auth
+returns 503 with an empty dashboard.
+
+### Windows on this machine
+
+Python lives at `C:\Users\Banele Mofokeng\AppData\Local\Python\pythoncore-3.14-64\python.exe`
+and is reachable as `py -3.14`. The project dependencies are already installed
+into that interpreter, so there is no venv to create:
+
+```bash
+py -3.14 -m uvicorn main:app --port 9000
+```
+
+If you want an isolated venv anyway, `psycopg2-binary` ships wheels for
+released Python versions only — on a brand-new interpreter pip falls back to
+building from source and needs the PostgreSQL client libraries. Python 3.14
+has a wheel, so a venv on it is fine here.
+
+### Checking it works
+
+```bash
+curl http://localhost:9000/health
+```
+
+A healthy local bot answers:
+
+```json
+{"status":"ok","redis":true,"tenants":1,"webhook_auth":false,"outbox_pending":0,"outbox_failed":0}
+```
+
+`webhook_auth: false` is expected and correct locally — no `WEBHOOK_SECRET` is
+set, so `/webhook` accepts a hand-written POST without a token. In production
+this must read `true`.
+
+`GET /health` also reports `outbox_failed`. A non-zero count means messages
+were queued but Evolution was unreachable — the common local case, because a
+tenant's `evolution_api_url` points at a real gateway that does not exist on
+your laptop. See "Testing the WhatsApp flow" below.
+
+---
+
+## Testing the WhatsApp flow locally
+
+The bot talks to Evolution over HTTP, and Evolution is the thing that delivers
+WhatsApp messages. Without it the bot still runs and still writes to the
+database, but every outbound message fails and lands in `outbox_failed`.
+
+Two pieces make the conversation testable without a real WhatsApp account.
+
+### 1. A fake Evolution API
+
+`scripts/fake_evolution.py` serves the one route the bot calls
+(`POST /message/sendText/{instance}`), logs every message it receives, and
+writes them to `scripts/evolution-inbox.log` so you can read what the bot
+would have sent:
+
+```bash
+py -3.14 scripts/fake_evolution.py     # listens on :9999
+```
+
+Then point a tenant at it — **Businesses → edit the business → Evolution API
+URL** — with the URL `http://localhost:9999`, and give the business an
+Evolution instance name. The bot reads both from the tenant row.
+
+### 2. A script that sends inbound messages
+
+`scripts/whatsapp.sh` posts inbound customer messages to the webhook in
+Evolution's shape, one per argument, in order:
+
+```bash
+bash scripts/whatsapp.sh "hi"
+bash scripts/whatsapp.sh "1" "1" "1"     # join queue → date → who for
+```
+
+The bot's replies land in `scripts/evolution-inbox.log`. The script's customer
+number and tenant number can be overridden:
+
+```bash
+CUSTOMER_NUMBER=27722222222@s.whatsapp.net TENANT_NUMBER=27810000000 \
+  bash scripts/whatsapp.sh "hi"
+```
+
+`WEBHOOK_SECRET` must be unset locally for this to work without a token — which
+is also why startup warns about it. Set one and add
+`?token=<secret>` to the webhook URL in the script.
+
+The state machine advances one step per message, so a booking is six replies:
+main menu → date → who for → service → agent → arrival time → confirmation.
+The last one writes a `queueentry` row, which then appears on the dashboard's
+live queue.
+
+### The routes are under `/admin`
+
+The API is not mounted at the root. `GET /tenants` is a 404; the real path is
+`GET /admin/tenants`. The full set:
+
+| Method | Path |
+|---|---|
+| POST | `/auth/login` |
+| GET | `/auth/me` |
+| GET | `/admin/tenants` |
+| GET | `/admin/services/{tenant_id}` |
+| GET | `/admin/agents/{tenant_id}` |
+| GET | `/admin/queue/{tenant_id}` |
+
+`/docs` lists them all, and `/health` and `/ping` are unauthenticated.
 
 ---
 
@@ -189,6 +316,21 @@ redeploy automatically on every push to `main`.
      until it's set. Use a different value from `JWT_SECRET`.
    - `SUPERADMIN_EMAIL`/`SUPERADMIN_PASSWORD` seed your super-admin account on startup
      (only if it doesn't already exist). Without them, no one can log in.
+   - **Changing `SUPERADMIN_PASSWORD` after the account exists does nothing.**
+     `seed_superadmin()` returns early when the email is already present, so
+     the env var is a *seed*, not a reset — the old password keeps working and
+     the new one is silently ignored. This is the most common reason a login
+     that "should" work answers "Invalid email or password". To change the
+     password of an account that already exists, either change it from the
+     dashboard, or reset it with the API:
+     ```bash
+     curl -X PATCH "https://<your-bot>/admin/users/<user_id>" \
+       -H "Authorization: Bearer <your-jwt>" \
+       -H "Content-Type: application/json" \
+       -d '{"password":"<new-password>"}'
+     ```
+     Deleting the row and restarting also works, but it discards every other
+     field on that user.
    - `ALLOWED_ORIGINS` is comma-separated; set it to your admin URL in production instead of `*`.
 5. Deploy. Check `GET /health` on the generated domain — `"webhook_auth"` must
    be `true`.

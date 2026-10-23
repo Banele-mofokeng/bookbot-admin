@@ -20,6 +20,9 @@ dist/
 .env
 .env.*
 
+# Local test artifacts
+scripts/evolution-inbox.log
+
 # OS / editor
 .DS_Store
 Thumbs.db

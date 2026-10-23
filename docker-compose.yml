@@ -1,0 +1,49 @@
+version: "3.8"
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: queuebot
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - botnet
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    networks:
+      - botnet
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    environment:
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/queuebot
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: dev-secret-not-for-prod
+      SUPERADMIN_EMAIL: you@example.com
+      SUPERADMIN_PASSWORD: devpassword123
+      WEBHOOK_SECRET: ""
+      ALLOWED_ORIGINS: "*"
+      TZ: Africa/Johannesburg
+    ports:
+      - "9000:9000"
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - botnet
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9000"]
+
+networks:
+  botnet:
+    driver: bridge
+
+volumes:
+  postgres_data:
