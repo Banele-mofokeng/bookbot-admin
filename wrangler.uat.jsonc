@@ -1,0 +1,11 @@
+{
+  "name": "bookbot-uat",
+  "compatibility_date": "2026-10-21",
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

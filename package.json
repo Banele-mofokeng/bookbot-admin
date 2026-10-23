@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "build:deploy": "node scripts/require-api-url.mjs && vite build",
     "deploy": "npm run build:deploy && wrangler deploy",
+    "deploy:uat": "bash scripts/deploy-uat.sh",
+    "deploy:prod": "bash scripts/deploy-prod.sh",
     "preview:cf": "npm run build:deploy && wrangler dev"
   },
   "dependencies": {
